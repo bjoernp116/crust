@@ -1,1 +1,11 @@
-exit(7 + 3);
+
+fun add(a: u8, b: u8) -> u32 {
+    let result = a + b;
+    let constant = 3 + 5;
+    return constant;
+}
+
+fun main() { 
+    let foo_value: u32 = add(3, 2, 1);
+    exit(foo_value);
+}

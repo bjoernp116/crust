@@ -1,6 +1,9 @@
 use std::{collections::VecDeque, fmt::Display};
 
-use crate::{lexer::Position, lexer::{Token, TokenType}};
+use crate::{
+    lexer::Position,
+    lexer::{Token, TokenType},
+};
 use anyhow::anyhow;
 
 #[derive(Clone)]
@@ -15,6 +18,7 @@ pub enum Node {
     Unary(UnaryOperator, Box<Node>, Position),
     Litteral(Litteral, Position),
     Identifier(String, Position),
+    FuncIdentifier(String, Vec<Node>, Position),
     Assignment(String, Box<Node>, Position),
 }
 
@@ -22,12 +26,18 @@ impl Node {
     pub fn position(&self) -> Position {
         #![allow(unused)]
         match self {
-            Self::Binary { left, operator, right, position } => position.clone(),
+            Self::Binary {
+                left,
+                operator,
+                right,
+                position,
+            } => position.clone(),
             Self::Unary(_, _, position) => position.clone(),
             Self::Litteral(_, position) => position.clone(),
             Self::Parenthesis(child) => child.position(),
             Self::Identifier(_, pos) => pos.clone(),
-            Self::Assignment(_, _, pos) => pos.clone()
+            Self::FuncIdentifier(_, _, pos) => pos.clone(),
+            Self::Assignment(_, _, pos) => pos.clone(),
         }
     }
 }
@@ -44,39 +54,63 @@ pub enum Litteral {
 pub enum Statement {
     Expression(Node),
     Exit(Node),
-    VarDecl(String, Node),
+    Return(Option<Node>),
+    VarDecl(String, Option<String>, Node),
+    FuncDecl {
+        identifier: String,
+        args: Vec<(String, String)>,
+        ret: Option<String>,
+        body: Box<Statement>,
+    },
     Block(Vec<Statement>),
     If(Node, Box<Statement>, Option<Box<Statement>>),
     While(Node, Box<Statement>),
-    For(Option<Box<Statement>>, Option<Node>, Option<Node>, Box<Statement>),
+    For(
+        Option<Box<Statement>>,
+        Option<Node>,
+        Option<Node>,
+        Box<Statement>,
+    ),
 }
 
 impl Display for Statement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Statement::Exit(t) => write!(f, "exit: {}", t)?,
+            Statement::Return(t) => write!(f, "return: {:?}", t)?,
             Statement::Expression(e) => write!(f, "expr: {}", e)?,
-            Statement::VarDecl(i, e) => write!(f, "decl: {} = {}", i, e)?,
+            Statement::VarDecl(i, t, e) => {
+                write!(f, "decl: {} = {} (type = {:?})", i, e, t)?
+            }
             Statement::Block(block) => {
                 writeln!(f, "block: {{\n")?;
                 for stmnt in block {
                     writeln!(f, "\t{}", stmnt)?;
                 }
                 writeln!(f, "}}\n")?;
-            },
+            }
             Statement::If(condition, then, els) => {
                 writeln!(f, "if {}", condition)?;
                 writeln!(f, "then {}", then)?;
                 if let Some(el) = els {
                     writeln!(f, "else {}", el)?;
                 }
-            },
+            }
             Statement::While(condition, body) => {
                 writeln!(f, "while {}", condition)?;
                 writeln!(f, "do {}", body)?;
-            },
+            }
             Statement::For(init, con, inc, body) => {
                 writeln!(f, "for {:?}, {:?}, {:?}", init, con, inc)?;
+                writeln!(f, "do {}", body)?;
+            }
+            Statement::FuncDecl {
+                identifier,
+                args,
+                ret,
+                body,
+            } => {
+                writeln!(f, "func {} ({:?}) -> {:?}", identifier, args, ret)?;
                 writeln!(f, "do {}", body)?;
             }
         }
@@ -137,7 +171,7 @@ pub enum BinaryOperator {
     G,
 
     Or,
-    And
+    And,
 }
 
 impl Display for BinaryOperator {
@@ -156,7 +190,6 @@ impl Display for BinaryOperator {
             BinaryOperator::G => ">",
             BinaryOperator::Or => "||",
             BinaryOperator::And => "&&",
-
         };
         write!(f, "{}", op)
     }
@@ -194,29 +227,52 @@ impl AstFactory {
     }
     pub fn parse_statement(&mut self) -> anyhow::Result<Statement> {
         let out = match self.tokens[self.current].token_type {
+            TokenType::Return => {
+                self.current += 1;
+                if let TokenType::SemiColon =
+                    self.tokens[self.current].token_type
+                {
+                    Ok(Statement::Return(None))                    
+                } else {
+                    let value = self.parse_assignment()?;
+                    Ok(Statement::Return(Some(value)))
+
+                }
+            }
             TokenType::Exit => {
                 self.current += 1;
                 let value = self.parse_assignment()?;
                 Ok(Statement::Exit(value))
-            },
+            }
             TokenType::Let => {
                 self.current += 1;
                 let identifier = self.parse_number()?;
                 if let Node::Identifier(name, _) = identifier {
+                    let variable_type = if let TokenType::Colon =
+                        self.tokens[self.current].token_type
+                    {
+                        self.current += 2;
+                        Some(self.tokens[self.current - 1].raw.clone())
+                    } else {
+                        None
+                    };
                     match self.tokens[self.current].token_type {
                         TokenType::SemiColon => {
-                            let pos = self.tokens[self.current].position.clone();
+                            let pos =
+                                self.tokens[self.current].position.clone();
                             let expr = Node::Litteral(Litteral::Nil, pos);
                             self.current += 1;
-                            Ok(Statement::VarDecl(name, expr))
-                        },
+                            Ok(Statement::VarDecl(name, variable_type, expr))
+                        }
                         TokenType::Equal => {
                             self.current += 1;
                             let expr = self.parse_assignment()?;
-                            Ok(Statement::VarDecl(name, expr)) 
-                        },
+                            Ok(Statement::VarDecl(name, variable_type, expr))
+                        }
                         _ => {
-                            eprintln!("Expected = or ; after variable declearation!");
+                            eprintln!(
+                                "Expected = or ; after variable declearation!"
+                            );
                             std::process::exit(70);
                         }
                     }
@@ -232,22 +288,24 @@ impl AstFactory {
                         TokenType::RightBrace => {
                             self.current += 1;
                             break;
-                        },
+                        }
                         TokenType::SemiColon => self.current += 1,
-                        _ => statements.push(self.parse_statement()?)
+                        _ => statements.push(self.parse_statement()?),
                     }
                     if self.current == self.tokens.len() {
-                        eprintln!("[line {}] Error at end: Expect '}}'.", 
-                            self.tokens[self.current - 1].position.line());
+                        eprintln!(
+                            "[line {}] Error at end: Expect '}}'.",
+                            self.tokens[self.current - 1].position.line()
+                        );
                         std::process::exit(65);
                     }
                 }
                 Ok(Statement::Block(statements))
-            },
+            }
             TokenType::If => {
                 self.current += 1;
                 match self.tokens[self.current].token_type {
-                    TokenType::LeftParen => {},
+                    TokenType::LeftParen => {}
                     _ => {
                         eprintln!("Expected ( after if!");
                         std::process::exit(65);
@@ -256,25 +314,25 @@ impl AstFactory {
                 self.current += 1;
                 let condition = self.parse_assignment()?;
                 self.current += 1;
-                let statement = Box::new(self.parse_statement()?); 
+                let statement = Box::new(self.parse_statement()?);
                 let else_stmnt = if self.current < self.tokens.len() {
                     match self.tokens[self.current].token_type {
                         TokenType::Else => {
                             self.current += 1;
                             Some(Box::new(self.parse_statement()?))
-                        },
-                        ref t => {
-                            None
                         }
+                        _ => None,
                     }
-                } else { None };
+                } else {
+                    None
+                };
 
                 Ok(Statement::If(condition, statement, else_stmnt))
-            },
+            }
             TokenType::While => {
                 self.current += 1;
                 match self.tokens[self.current].token_type {
-                    TokenType::LeftParen => {},
+                    TokenType::LeftParen => {}
                     _ => {
                         eprintln!("Expected ( after if!");
                         std::process::exit(65);
@@ -283,14 +341,14 @@ impl AstFactory {
                 self.current += 1;
                 let condition = self.parse_assignment()?;
                 self.current += 1;
-                let statement = Box::new(self.parse_statement()?); 
+                let statement = Box::new(self.parse_statement()?);
 
                 Ok(Statement::While(condition, statement))
             }
             TokenType::For => {
                 self.current += 1;
                 match self.tokens[self.current].token_type {
-                    TokenType::LeftParen => {},
+                    TokenType::LeftParen => {}
                     _ => {
                         eprintln!("Expected ( after for!");
                         std::process::exit(65);
@@ -304,59 +362,123 @@ impl AstFactory {
                         if self.is(TokenType::RightParen) {
                             self.current += 1;
                             let body = Box::new(self.parse_statement()?);
-                            return Ok(Statement::For(None, None, None, body))
+                            return Ok(Statement::For(None, None, None, body));
                         }
                         let increment = self.parse_assignment()?;
                         self.current += 1;
                         let body = Box::new(self.parse_statement()?);
-                        return Ok(Statement::For(None, None, Some(increment), body))
+                        return Ok(Statement::For(
+                            None,
+                            None,
+                            Some(increment),
+                            body,
+                        ));
                     } else {
                         let condition = self.parse_assignment()?;
                         self.current += 1;
                         if self.is(TokenType::RightParen) {
                             self.current += 1;
                             let body = Box::new(self.parse_statement()?);
-                            return Ok(Statement::For(None, Some(condition), None, body))
+                            return Ok(Statement::For(
+                                None,
+                                Some(condition),
+                                None,
+                                body,
+                            ));
                         }
                     }
                 } else {
-
                 }
                 if let Ok(constructor) = self.parse_statement() {
                     if let Ok(condition) = self.parse_assignment() {
                         self.current += 1;
-                        if let Ok(incrementer) = self.parse_assignment() { 
+                        if let Ok(incrementer) = self.parse_assignment() {
                             self.current += 1;
                             let body = Box::new(self.parse_statement()?);
-                            return Ok(
-                                Statement::For(
-                                    Some(Box::new(constructor)), Some(condition), Some(incrementer), body
-                                )
-                            );
+                            return Ok(Statement::For(
+                                Some(Box::new(constructor)),
+                                Some(condition),
+                                Some(incrementer),
+                                body,
+                            ));
                         }
                         self.current += 1;
                         let body = Box::new(self.parse_statement()?);
-                        return Ok(
-                            Statement::For(
-                                Some(Box::new(constructor)), Some(condition), None, body
-                            )
-                        );
+                        return Ok(Statement::For(
+                            Some(Box::new(constructor)),
+                            Some(condition),
+                            None,
+                            body,
+                        ));
                     }
                     self.current += 1;
                     let body = Box::new(self.parse_statement()?);
-                    return Ok(
-                        Statement::For(
-                            Some(Box::new(constructor)), None, None, body
-                        )
-                    );
+                    return Ok(Statement::For(
+                        Some(Box::new(constructor)),
+                        None,
+                        None,
+                        body,
+                    ));
                 }
                 self.current += 1;
                 println!("body");
                 let body = Box::new(self.parse_statement()?);
 
-                Ok(Statement::For(
-                    None, None, None, body)
-                )
+                Ok(Statement::For(None, None, None, body))
+            }
+            TokenType::Fun => {
+                self.current += 1;
+                let identifier_token = self.parse_var_identifier()?;
+                self.current += 1;
+                if let Node::Identifier(ident, _) = identifier_token {
+                    match self.tokens[self.current].token_type {
+                        TokenType::LeftParen => {}
+                        _ => {
+                            return Err(anyhow!(
+                                "Expected initializer list after function defenition!"
+                            ));
+                        }
+                    }
+                    self.current += 1;
+                    let mut args = Vec::new();
+                    loop {
+                        let curr = self.tokens[self.current].token_type.clone();
+                        let next =
+                            self.tokens[self.current + 1].token_type.clone();
+                        match (curr, next) {
+                            (_, TokenType::RightParen) => {
+                                self.current += 1;
+                                break;
+                            }
+                            (TokenType::RightParen, _) => break,
+                            _ => {
+                                let arg = self.parse_named_argument()?;
+                                args.push(arg);
+                            }
+                        }
+                    }
+                    self.current += 1;
+                    let mut ret = None;
+                    if let TokenType::Arrow =
+                        self.tokens[self.current].token_type
+                    {
+                        self.current += 1;
+                        if let Node::Identifier(return_type, _) =
+                            self.parse_number()?
+                        {
+                            ret = Some(return_type);
+                        }
+                    }
+                    let body = self.parse_statement()?;
+                    Ok(Statement::FuncDecl {
+                        identifier: ident,
+                        args,
+                        ret,
+                        body: Box::new(body),
+                    })
+                } else {
+                    Err(anyhow!("Expected identifier in function defenition!"))
+                }
             }
             _ => {
                 let value = self.parse_assignment()?;
@@ -368,14 +490,35 @@ impl AstFactory {
             Some(Token {
                 position: _,
                 raw: _,
-                token_type: TokenType::SemiColon
-            })=> {
+                token_type: TokenType::SemiColon,
+            }) => {
                 self.current += 1;
             }
             _ => (),
         }
-        
+
         out
+    }
+    fn parse_named_argument(&mut self) -> anyhow::Result<(String, String)> {
+        if let Node::Identifier(identifier, _) = self.parse_number()? {
+            if let TokenType::Colon = self.tokens[self.current].token_type {
+                self.current += 1;
+                if let Node::Identifier(typename, _) = self.parse_number()? {
+                    if let TokenType::Comma =
+                        self.tokens[self.current].token_type
+                    {
+                        self.current += 1;
+                    };
+                    Ok((identifier, typename))
+                } else {
+                    Err(anyhow!("Expected typename after colon!"))
+                }
+            } else {
+                Err(anyhow!("Expected colon after argument!"))
+            }
+        } else {
+            Err(anyhow!("Expected identifier in initializer list!"))
+        }
     }
     fn parse_assignment(&mut self) -> anyhow::Result<Node> {
         let identifier: Node = self.parse_or()?;
@@ -385,15 +528,13 @@ impl AstFactory {
                     if let Node::Identifier(name, pos) = identifier {
                         self.current += 1;
                         let value = self.parse_assignment()?;
-                        let position = Position::range(
-                            pos,
-                            value.position()
-                        );
-                        let node = Node::Assignment(name, Box::new(value), position); 
+                        let position = Position::range(pos, value.position());
+                        let node =
+                            Node::Assignment(name, Box::new(value), position);
                         return Ok(node);
                     }
-                },
-                _ => break
+                }
+                _ => break,
             }
         }
         Ok(identifier)
@@ -410,15 +551,16 @@ impl AstFactory {
                         break;
                     }
                     let right = Box::new(self.parse_and()?);
-                    let position = Position::range(node.position(), right.position());
+                    let position =
+                        Position::range(node.position(), right.position());
                     node = Node::Binary {
                         left: Box::new(node),
                         right,
                         operator: op.try_into()?,
-                        position
+                        position,
                     };
-                },
-                _ => break 
+                }
+                _ => break,
             }
         }
         Ok(node)
@@ -435,15 +577,16 @@ impl AstFactory {
                         break;
                     }
                     let right = Box::new(self.parse_equality()?);
-                    let position = Position::range(node.position(), right.position());
+                    let position =
+                        Position::range(node.position(), right.position());
                     node = Node::Binary {
                         left: Box::new(node),
                         right,
                         operator: op.try_into()?,
-                        position
+                        position,
                     };
-                },
-                _ => break 
+                }
+                _ => break,
             }
         }
         Ok(node)
@@ -464,12 +607,13 @@ impl AstFactory {
                         break;
                     }
                     let right = Box::new(self.parse_term()?);
-                    let position = Position::range(node.position(), right.position());
+                    let position =
+                        Position::range(node.position(), right.position());
                     node = Node::Binary {
                         left: Box::new(node),
                         right,
                         operator: op.try_into()?,
-                        position
+                        position,
                     };
                 }
                 _ => break,
@@ -489,12 +633,13 @@ impl AstFactory {
                         break;
                     }
                     let right = Box::new(self.parse_factor()?);
-                    let position = Position::range(node.position(), right.position());
+                    let position =
+                        Position::range(node.position(), right.position());
                     node = Node::Binary {
                         left: Box::new(node),
                         right,
                         operator: op.try_into()?,
-                        position
+                        position,
                     };
                 }
                 _ => break,
@@ -514,7 +659,8 @@ impl AstFactory {
                         break;
                     }
                     let right = Box::new(self.parse_exponent()?);
-                    let position = Position::range(node.position(), right.position());
+                    let position =
+                        Position::range(node.position(), right.position());
                     node = Node::Binary {
                         left: Box::new(node),
                         right,
@@ -539,12 +685,13 @@ impl AstFactory {
                         break;
                     }
                     let right = Box::new(self.parse_primary()?);
-                    let position = Position::range(node.position(), right.position());
+                    let position =
+                        Position::range(node.position(), right.position());
                     node = Node::Binary {
                         left: Box::new(node),
                         right,
                         operator: op.try_into()?,
-                        position
+                        position,
                     };
                 }
                 _ => break,
@@ -610,9 +757,9 @@ impl AstFactory {
             return Err(anyhow!("Out of bounds access in parse_number"));
         }
         let position = self.tokens[self.current].position.clone();
-        match &self.tokens[self.current].token_type {
+        match self.tokens[self.current].token_type.clone() {
             TokenType::Number(x) => {
-                let number = *x;
+                let number = x;
                 self.current += 1;
                 Ok(Node::Litteral(Litteral::Number(number as f64), position))
             }
@@ -631,16 +778,59 @@ impl AstFactory {
             TokenType::StringLitteral(s) => {
                 self.current += 1;
                 Ok(Node::Litteral(Litteral::String(s.clone()), position))
-            },
+            }
             TokenType::Identifier(i) => {
                 self.current += 1;
-                Ok(Node::Identifier(i.clone(), position)) 
-            },
+                if let TokenType::LeftParen =
+                    self.tokens[self.current].token_type
+                {
+                    self.parse_func_identifier(i, position)
+                } else {
+                    Ok(Node::Identifier(i.clone(), position))
+                }
+            }
             _ => Err(anyhow!(
                 "[line {}] Error at '{}': Expect expression.",
                 &self.tokens[self.current].position.line(),
                 &self.tokens[self.current].raw
             )),
+        }
+    }
+
+    fn parse_func_identifier(
+        &mut self,
+        i: String,
+        position: Position,
+    ) -> anyhow::Result<Node> {
+        self.current += 1;
+        let mut args = Vec::new();
+        loop {
+            let prev = self.tokens[self.current - 1].token_type.clone();
+            let curr = self.tokens[self.current].token_type.clone();
+            println!("{:?}, {:?}", prev, curr);
+            match (prev, curr) {
+                (_, TokenType::RightParen) => {
+                    self.current += 1;
+                    break;
+                }
+                (TokenType::RightParen, _) => break,
+                _ => {
+                    let arg = self.parse_equality()?;
+                    args.push(arg);
+                    self.current += 1;
+                }
+            }
+        }
+        Ok(Node::FuncIdentifier(i.clone(), args, position))
+    }
+    fn parse_var_identifier(&mut self) -> anyhow::Result<Node> {
+        let position = self.tokens[self.current].position.clone();
+        if let TokenType::Identifier(i) =
+            self.tokens[self.current].token_type.clone()
+        {
+            Ok(Node::Identifier(i, position))
+        } else {
+            Err(anyhow!("Expected expression"))
         }
     }
 }
@@ -692,7 +882,8 @@ impl Display for Node {
             } => write!(f, "({} {} {})", operator, left, right),
             Node::Parenthesis(e) => write!(f, "(group {})", e),
             Node::Identifier(i, _) => write!(f, "_{}", i),
-            Node::Assignment(i, v, _) => write!(f, "{} = {}", i, v)
+            Node::FuncIdentifier(i, a, _) => write!(f, "_{}({:?})", i, a),
+            Node::Assignment(i, v, _) => write!(f, "{} = {}", i, v),
         }
     }
 }
@@ -711,7 +902,8 @@ impl std::fmt::Debug for Node {
             } => write!(f, "({} {:?} {:?})", operator, left, right),
             Node::Parenthesis(e) => write!(f, "(group {:?})", e),
             Node::Identifier(i, _) => write!(f, "_{}", i),
-            Node::Assignment(i, v, _) => write!(f, "{} = {}", i, v)
+            Node::FuncIdentifier(i, a, _) => write!(f, "_{}({:?})", i, a),
+            Node::Assignment(i, v, _) => write!(f, "{} = {}", i, v),
         }
     }
 }

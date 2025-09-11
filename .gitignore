@@ -3,3 +3,4 @@
 *.asm
 *.o
 Cargo.lock
+/build

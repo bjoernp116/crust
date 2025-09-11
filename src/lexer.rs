@@ -3,20 +3,25 @@ use std::fmt::Display;
 #[derive(Clone)]
 pub struct Position {
     pub from: (usize, usize),
-    pub to: (usize, usize)
+    pub to: (usize, usize),
 }
 
 impl Position {
-    pub fn new(line1: usize, col1: usize, line2: usize, col2: usize) -> Position {
+    pub fn new(
+        line1: usize,
+        col1: usize,
+        line2: usize,
+        col2: usize,
+    ) -> Position {
         Self {
             from: (line1, col1),
-            to: (line2, col2)
+            to: (line2, col2),
         }
     }
     pub fn range(from: Self, to: Self) -> Self {
         Self {
             from: from.from,
-            to: to.to
+            to: to.to,
         }
     }
     pub fn line(&self) -> usize {
@@ -38,11 +43,14 @@ pub enum TokenType {
     Minus,
     Slash,
     SemiColon,
+    Colon,
     Equal,
     Bang,
     Greater,
     Less,
     Carrot,
+
+    Arrow,
 
     If,
     And,
@@ -86,11 +94,11 @@ pub fn scan(str: String) -> anyhow::Result<Vec<Token>> {
     let mut i = 0;
     while i < stream.len() {
         match stream[i] {
-            ' ' | '\t' => {},
+            ' ' | '\t' => {}
             '\n' => {
                 line_number += 1;
                 new_line = i;
-            },
+            }
             x if x.is_numeric() => {
                 let mut float = false;
                 let first_line = line_number;
@@ -99,16 +107,20 @@ pub fn scan(str: String) -> anyhow::Result<Vec<Token>> {
                     if i != stream.len() && stream[i] == '.' && !float {
                         float = true;
                         buffer.push('.');
-                        i+=1;
+                        i += 1;
                         continue;
                     }
                     if i == stream.len() || !stream[i].is_numeric() {
-
                         let number = buffer.clone().parse::<f64>()?;
                         let token = Token {
                             token_type: TokenType::Number(number),
                             raw: buffer.clone(),
-                            position: Position::new(first_line, first_col, line_number, i - new_line),
+                            position: Position::new(
+                                first_line,
+                                first_col,
+                                line_number,
+                                i - new_line,
+                            ),
                         };
                         buffer.clear();
                         i -= 1;
@@ -126,13 +138,15 @@ pub fn scan(str: String) -> anyhow::Result<Vec<Token>> {
                 loop {
                     if i == stream.len() {
                         let token = Token {
-                            token_type: TokenType::Invalid(format!("Unterminated string.")),
+                            token_type: TokenType::Invalid(format!(
+                                "Unterminated string."
+                            )),
                             raw: buffer.clone(),
                             position: Position::new(
-                                first_line, 
-                                first_col, 
-                                line_number, 
-                                i - new_line
+                                first_line,
+                                first_col,
+                                line_number,
+                                i - new_line,
                             ),
                         };
                         out.push(token);
@@ -140,13 +154,15 @@ pub fn scan(str: String) -> anyhow::Result<Vec<Token>> {
                     }
                     if stream[i] == '"' {
                         let token = Token {
-                            token_type: TokenType::StringLitteral(buffer.clone()),
+                            token_type: TokenType::StringLitteral(
+                                buffer.clone(),
+                            ),
                             raw: format!("\"{}\"", buffer.clone()),
                             position: Position::new(
-                                first_line, 
-                                first_col, 
-                                line_number, 
-                                i - new_line
+                                first_line,
+                                first_col,
+                                line_number,
+                                i - new_line,
                             ),
                         };
                         buffer.clear();
@@ -160,41 +176,56 @@ pub fn scan(str: String) -> anyhow::Result<Vec<Token>> {
                     }
                     i += 1;
                 }
-            }
-            '=' | '!' | '<' | '>' if i+1 < stream.len() && stream[i+1] == '=' => {
+            },
+            '-' if stream[i + 1] == '>' => {
+                let token = Token {
+                    token_type: TokenType::Arrow,
+                    raw: format!("->"),
+                    position: Position::new(line_number, i, line_number, i + 1),
+                };
+                out.push(token);
+                i += 1;
+            },
+            '=' | '!' | '<' | '>'
+                if i + 1 < stream.len() && stream[i + 1] == '=' =>
+            {
                 let token_type = match stream[i] {
                     '=' => TokenType::EqualEqual,
                     '!' => TokenType::BangEqual,
                     '>' => TokenType::GreaterEqual,
                     '<' => TokenType::LessEqual,
-                    _ => unreachable!()
+                    _ => unreachable!(),
                 };
                 let token = Token {
                     token_type,
-                    raw: format!("{}{}", stream[i], stream[i+1]),
-                    position: Position::new(line_number, i, line_number, i+1),
+                    raw: format!("{}{}", stream[i], stream[i + 1]),
+                    position: Position::new(line_number, i, line_number, i + 1),
                 };
                 out.push(token);
                 i += 1;
             }
-            '/' if i+1 < stream.len() && stream[i+1] == '/' => {
-                loop {
-                    if i == stream.len() || stream[i] == '\n' {
-                        line_number += 1;
-                        break;
-                    }
-                    i += 1;
+            '/' if i + 1 < stream.len() && stream[i + 1] == '/' => loop {
+                if i == stream.len() || stream[i] == '\n' {
+                    line_number += 1;
+                    break;
                 }
-            }
+                i += 1;
+            },
             c if c.is_alphabetic() || c == '_' => {
                 let first_col = i - new_line;
                 loop {
                     if i == stream.len()
-                    || !(stream[i].is_alphanumeric() || stream[i] == '_') {
+                        || !(stream[i].is_alphanumeric() || stream[i] == '_')
+                    {
                         let token = Token {
                             token_type: TokenType::from(buffer.clone()),
                             raw: buffer.clone(),
-                            position: Position::new(line_number, first_col, line_number, i - new_line)
+                            position: Position::new(
+                                line_number,
+                                first_col,
+                                line_number,
+                                i - new_line,
+                            ),
                         };
                         buffer.clear();
                         out.push(token);
@@ -209,7 +240,12 @@ pub fn scan(str: String) -> anyhow::Result<Vec<Token>> {
                 let token = Token {
                     token_type: TokenType::from(stream[i]),
                     raw: format!("{}", stream[i]),
-                    position: Position::new(line_number, i - new_line, line_number, i - new_line)
+                    position: Position::new(
+                        line_number,
+                        i - new_line,
+                        line_number,
+                        i - new_line,
+                    ),
                 };
                 out.push(token);
             }
@@ -226,7 +262,7 @@ impl Display for Token {
             Invalid(err) => {
                 eprint!("[line {}]: Error: {}", self.position.line(), err);
                 return Ok(());
-            },
+            }
             LeftParen => "LEFT_PAREN",
             RightParen => "RIGHT_PAREN",
             LeftBrace => "LEFT_BRACE",
@@ -238,11 +274,14 @@ impl Display for Token {
             Minus => "MINUS",
             Slash => "SLASH",
             SemiColon => "SEMICOLON",
+            Colon => "COLON",
             Equal => "EQUAL",
             Bang => "BANG",
             Greater => "GREATER",
             Less => "LESS",
             Carrot => "CARROT",
+
+            Arrow => "ARROW",
 
             If => "IF",
             And => "AND",
@@ -257,7 +296,7 @@ impl Display for Token {
             Return => "RETURN",
             This => "THIS",
             True => "TRUE",
-            Var => "VAR",
+            Let => "LET",
             While => "WHILE",
 
             EqualEqual => "EQUAL_EQUAL",
@@ -267,7 +306,7 @@ impl Display for Token {
 
             Number(_) => "NUMBER",
             StringLitteral(_) => "STRING",
-            Identifier(_) => "IDENTIFIER"
+            Identifier(_) => "IDENTIFIER",
         };
         write!(f, "{} {}", str, self.raw)?;
         Ok(())
@@ -289,6 +328,7 @@ impl From<char> for TokenType {
             '-' => Minus,
             '/' => Slash,
             ';' => SemiColon,
+            ':' => Colon,
             '=' => Equal,
             '!' => Bang,
             '>' => Greater,
@@ -318,7 +358,7 @@ impl From<String> for TokenType {
             "true" => True,
             "let" => Let,
             "while" => While,
-            _ => Identifier(value)
+            _ => Identifier(value),
         }
     }
 }
@@ -327,7 +367,7 @@ impl Token {
     pub fn is_valid(&self) -> bool {
         match self.token_type {
             TokenType::Invalid(_) => false,
-            _ => true
+            _ => true,
         }
     }
 }
