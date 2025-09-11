@@ -4,7 +4,7 @@ use anyhow::anyhow;
 
 use crate::{
     parser::{BinaryOperator, Litteral, Node, Statement},
-    stack::{Stack, SymbolTable},
+    stack::{SymbolTable},
     types::{Register, Type, TypeHandler},
 };
 
@@ -16,23 +16,23 @@ pub struct Function {
 
 pub struct Compiler {
     assembly: String,
-    stack: Stack,
     type_handler: TypeHandler,
     symbol_table: SymbolTable,
     functions: HashMap<String, Function>,
     current_function: String,
+    stack_size: isize,
 }
 
 impl Compiler {
     pub fn new() -> Self {
         let assembly = String::new();
         Self {
-            stack: Stack::new(),
             assembly,
             type_handler: TypeHandler::new(),
             symbol_table: SymbolTable::new(),
             functions: HashMap::new(),
             current_function: String::new(),
+            stack_size: 0,
         }
     }
     pub fn gen_binary_operator(&mut self, operator: BinaryOperator, t: Type) {
@@ -105,11 +105,10 @@ impl Compiler {
                 } else {
                     Type {
                         size: usize::max(a_type.size, b_type.size),
-                        explicit: false,
                     }
                 };
-                self.stack_pop("rax")?;
-                self.stack_pop("rbx")?;
+                self.stack_pop("rax");
+                self.stack_pop("rbx");
                 self.gen_binary_operator(operator, typ);
                 self.stack_push("rax");
                 Ok(typ)
@@ -144,7 +143,7 @@ impl Compiler {
                 }
                 for (i, (_, _)) in function.args.iter().enumerate() {
                     let register = arg_register[i + 1];
-                    self.stack_pop(register)?;
+                    self.stack_pop(register);
                 }
                 self.push(format!("call {}", identifier));
                 if let Some(_) = function.ret {
@@ -155,7 +154,6 @@ impl Compiler {
                 } else {
                     Ok(Type {
                         size: 0,
-                        explicit: true,
                     })
                 }
             }
@@ -169,7 +167,7 @@ impl Compiler {
                 self.push_header(";; exit");
                 self.gen_expr(node, None)?;
                 self.push("mov rax, 60");
-                self.stack_pop("rdi")?;
+                self.stack_pop("rdi");
                 self.push("syscall");
                 self.push_header(";; /exit");
             }
@@ -192,9 +190,9 @@ impl Compiler {
                         _ => (),
                     }
                 }
-                self.stack_pop("rax")?;
+                self.stack_pop("rax");
                 self.push("mov rsp, rbp");
-                self.stack_pop("rbp")?;
+                self.stack_pop("rbp");
                 self.push("ret");
                 self.push_header(";; /return");
             }
@@ -202,7 +200,7 @@ impl Compiler {
                 self.push_header(";; variable decleration");
                 self.gen_expr(node, None)?;
                 let offset = self.symbol_table.get(&identifier);
-                self.stack_pop("rax")?;
+                self.stack_pop("rax");
                 self.push(format!("mov {}, rax", offset));
                 self.push_header(";; /variable decleration");
             }
@@ -230,7 +228,7 @@ impl Compiler {
                 self.gen_statement(*body)?;
                 if let None = ret {
                     self.push("mov rsp, rbp");
-                    self.stack_pop("rbp")?;
+                    self.stack_pop("rbp");
                     self.push("ret");
                 }
                 self.symbol_table.clear();
@@ -290,16 +288,13 @@ impl Compiler {
     }
 
     fn stack_push(&mut self, register: &str) {
-        println!("push {}", register);
-        let asm = self.stack.push(register);
-        self.push(asm.as_str());
+        self.stack_size += 1;
+        self.push(format!("push {}", register));
     }
 
-    fn stack_pop(&mut self, register: &str) -> anyhow::Result<()> {
-        println!("pop {}", register);
-        let asm = self.stack.pop(register)?;
-        self.push(asm.as_str());
-        Ok(())
+    fn stack_pop(&mut self, register: &str) { 
+        self.stack_size -= 1;
+        self.push(format!("pop {}", register));
     }
 
     fn push(&mut self, line: impl Into<String>) {

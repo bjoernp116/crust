@@ -2,15 +2,14 @@ use std::collections::HashMap;
 
 use anyhow::anyhow;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Type {
     pub size: usize,
-    pub explicit: bool,
 }
 
 impl Default for Type {
     fn default() -> Self {
-        Type { size: 4, explicit: false}
+        Type { size: 4 }
     }
 }
 
@@ -22,10 +21,10 @@ pub struct TypeHandler {
 impl TypeHandler {
     pub fn new() -> Self {
         let mut types = HashMap::new();
-        types.insert("u8".to_owned(),  Type { size: 1, explicit: true });
-        types.insert("u16".to_owned(), Type { size: 2, explicit: true });
-        types.insert("u32".to_owned(), Type { size: 4, explicit: true });
-        types.insert("u64".to_owned(), Type { size: 8, explicit: true });
+        types.insert("u8".to_owned(),  Type { size: 1 });
+        types.insert("u16".to_owned(), Type { size: 2 });
+        types.insert("u32".to_owned(), Type { size: 4 });
+        types.insert("u64".to_owned(), Type { size: 8 });
         Self {
             types
         }

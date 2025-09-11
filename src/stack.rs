@@ -1,64 +1,17 @@
 use crate::{
-    parser::Statement,
+    parser::{Node, Statement},
     types::{Type, TypeHandler},
 };
 use std::collections::HashMap;
 
 use anyhow::anyhow;
 
+#[derive(Debug, Clone)]
 pub struct Variable {
-    pub location: isize,
+    pub offset: isize,
     pub variable_type: Type,
-}
-
-pub struct Stack {
-    pub stack_size: isize,
-    variables: HashMap<String, Variable>,
-}
-
-impl Stack {
-    pub fn new() -> Stack {
-        Stack {
-            stack_size: 0,
-            variables: HashMap::new(),
-        }
-    }
-    pub fn declare_var(&mut self, identifier: String, variable_type: Type) {
-        let variable = Variable {
-            location: self.stack_size,
-            variable_type,
-        };
-        self.variables.insert(identifier, variable);
-    }
-    pub fn push(&mut self, register: &str) -> String {
-        self.stack_size += 1; //variable_type.size;
-        format!("push {}", register)
-    }
-    pub fn pop(&mut self, register: &str) -> anyhow::Result<String> {
-        if false {
-            //self.stack_size == 0 {
-            Err(anyhow!(";; Stack size error!"))
-        } else {
-            self.stack_size -= 1;
-            Ok(format!("pop {}", register))
-        }
-    }
-    pub fn contains(&self, identifier: &String) -> bool {
-        self.variables.contains_key(identifier)
-    }
-    pub fn get(&self, identifier: &String) -> anyhow::Result<(String, Type)> {
-        if let Some(variable) = self.variables.get(identifier) {
-            let offset =
-                (self.stack_size as isize - variable.location as isize - 1)
-                    * 8 as isize;
-            Ok((
-                format!("QWORD [rsp + {}]", offset),
-                variable.variable_type.clone(),
-            ))
-        } else {
-            Err(anyhow!("Undecleared identifier!"))
-        }
-    }
+    pub explicit_type: bool,
+    pub argument: bool
 }
 
 fn size_to_asm_word(size: usize) -> String {
@@ -73,7 +26,7 @@ fn size_to_asm_word(size: usize) -> String {
 
 #[derive(Debug)]
 pub struct SymbolTable {
-    table: HashMap<String, isize>,
+    table: HashMap<String, Variable>,
     pub sum: isize,
 }
 
@@ -91,7 +44,7 @@ impl SymbolTable {
     ) -> anyhow::Result<()> {
         let mut symbol_list = Vec::new();
         Self::get_symbols(stmt, &mut symbol_list, type_handler)?;
-        symbol_list.sort_by(|c, n| c.1.cmp(&n.1));
+        // sort
         symbol_list.reverse();
         for (ident, type_size) in symbol_list {
             self.sum += type_size as isize;
@@ -130,17 +83,17 @@ impl SymbolTable {
 
     fn get_symbols(
         stmt: Statement,
-        symbol_table: &mut Vec<(String, usize)>,
+        symbol_table: &mut Vec<(String, Type)>,
         type_handler: &mut TypeHandler,
     ) -> anyhow::Result<()> {
         match stmt {
-            Statement::VarDecl(ident, t, _) => {
-                let type_size: usize = if let Some(typename) = t {
-                    type_handler.get(&typename)?.size
+            Statement::VarDecl(ident, t, node) => {
+                let variable_type: Type = if let Some(typename) = t {
+                    type_handler.get(&typename)?.clone()
                 } else {
-                    Type::default().size
+                    self.infer_type(&node).0
                 };
-                symbol_table.push((ident, type_size));
+                symbol_table.push((ident, variable_type));
             }
             Statement::Block(stmts) => {
                 for stmt in stmts {
@@ -150,5 +103,27 @@ impl SymbolTable {
             _ => (),
         }
         Ok(())
+    }
+    
+    fn infer_type(node: Node) -> anyhow::Result<(Type, bool)> {
+        match node {
+            Node::Binary { left, right, operator: _, position: _ } => {
+                let (l_t, l_e) = Self::infer_type(*left)?;
+                let (r_t, r_e) = Self::infer_type(*right)?;
+                match (l_e, r_e) {
+                    (true, false) => Ok((l_t, true)),
+                    (false, true) => Ok((r_t, true)),
+                    (false, false) => Ok((Type::default(), false)),
+                    (true, true) => {
+                        if l_t == r_t {
+                            Ok((l_t, true))
+                        } else {
+                            Err(anyhow!("type mismatch"))
+                        }
+                    },
+                }
+            } 
+            _ => todo!()
+        }
     }
 }
