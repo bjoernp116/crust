@@ -30,9 +30,9 @@ impl TypeHandler {
         }
     }
 
-    pub fn get(&self, identifier: &String) -> anyhow::Result<&Type> {
+    pub fn get(&self, identifier: String) -> anyhow::Result<&Type> {
         self.types
-            .get(identifier)
+            .get(&identifier)
             .ok_or(anyhow!("Undefined type: {}", identifier))
     }
 }

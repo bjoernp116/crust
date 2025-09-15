@@ -3,9 +3,7 @@ use std::{collections::HashMap, fmt::Display};
 use anyhow::anyhow;
 
 use crate::{
-    parser::{BinaryOperator, Litteral, Node, Statement},
-    stack::{SymbolTable},
-    types::{Register, Type, TypeHandler},
+    lexer::Position, parser::{BinaryOperator, Litteral, Node, Statement}, stack::SymbolTable, types::{Register, Type, TypeHandler}
 };
 
 #[derive(Clone)]
@@ -88,9 +86,10 @@ impl Compiler {
 
     pub fn gen_expr(
         &mut self,
-        expr: Node,
+        mut expr: Node,
         t: Option<Type>,
     ) -> anyhow::Result<Type> {
+        expr.optimize();
         match expr {
             Node::Binary {
                 left,
@@ -142,7 +141,7 @@ impl Compiler {
                     self.gen_expr(value, Some(t))?;
                 }
                 for (i, (_, _)) in function.args.iter().enumerate() {
-                    let register = arg_register[i + 1];
+                    let register = arg_register[i];
                     self.stack_pop(register);
                 }
                 self.push(format!("call {}", identifier));
@@ -152,9 +151,7 @@ impl Compiler {
                 if let Some(ret_type) = function.ret {
                     Ok(ret_type)
                 } else {
-                    Ok(Type {
-                        size: 0,
-                    })
+                    Ok(Type { size: 0 })
                 }
             }
             _ => todo!(),
@@ -216,14 +213,14 @@ impl Compiler {
                     args.clone(),
                     ret.clone(),
                 )?;
-                self.symbol_table.push_args(args)?;
+                self.symbol_table.push_args(args, &mut self.type_handler)?;
                 self.symbol_table
                     .find_locals(*body.clone(), &mut self.type_handler)?;
                 println!("{:#?}", self.symbol_table);
                 self.push_header(format!("\n{}:", identifier));
                 self.stack_push("rbp");
                 self.push("mov rbp, rsp");
-                let reserved = self.symbol_table.sum;
+                let reserved = self.symbol_table.reserved();
                 self.push(format!("sub rsp, {}", reserved));
                 self.gen_statement(*body)?;
                 if let None = ret {
@@ -274,11 +271,11 @@ impl Compiler {
         let mut args: Vec<(String, Type)> = Vec::new();
         for arg in arguments {
             let (ident, typename) = arg;
-            let t: Type = self.type_handler.get(&typename)?.clone();
+            let t: Type = self.type_handler.get(typename)?.clone();
             args.push((ident, t));
         }
         let ret = if let Some(typename) = ret_typename {
-            Some(self.type_handler.get(&typename)?.clone())
+            Some(self.type_handler.get(typename)?.clone())
         } else {
             None
         };
@@ -292,7 +289,7 @@ impl Compiler {
         self.push(format!("push {}", register));
     }
 
-    fn stack_pop(&mut self, register: &str) { 
+    fn stack_pop(&mut self, register: &str) {
         self.stack_size -= 1;
         self.push(format!("pop {}", register));
     }
@@ -335,4 +332,79 @@ fn filter_function_statements(
         }
     }
     (funcs, rest)
+}
+
+impl Node {
+    pub fn optimize(&mut self) {
+        match self {
+            Node::Binary { left, right, operator, position } => {
+                let mut left = *left.clone();
+                let mut right = *right.clone();
+                left.optimize();
+                right.optimize();
+                match (left, right) {
+                    (Node::Litteral(l, _), Node::Litteral(r, _)) => {
+                        if let Ok(optimized) = operator.eval(l, r) {
+                            *self = Node::Litteral(optimized, position.clone()); 
+                        }
+                    }
+                    _ => ()
+                }
+            },
+            Node::Parenthesis(node) => node.optimize(),
+            _ => ()
+        }
+    }
+}
+
+
+impl BinaryOperator {
+    fn eval(&self, left: Litteral, right: Litteral) -> anyhow::Result<Litteral> {
+        use Litteral::*;
+        use BinaryOperator::*;
+
+        match (left.clone(), self, right.clone()) {
+            (Number(l), Eq,  Number(r)) => Ok(Boolean(l == r)),
+            (Number(l), NEq,  Number(r)) => Ok(Boolean(l != r)),
+            (Number(l), LEq,  Number(r)) => Ok(Boolean(l <= r)),
+            (Number(l), GEq,  Number(r)) => Ok(Boolean(l >= r)),
+            (Number(l), L,  Number(r)) => Ok(Boolean(l < r)),
+            (Number(l), G,  Number(r)) => Ok(Boolean(l > r)),
+
+            (Number(l), Add,  Number(r)) => Ok(Number(l + r)),
+            (Number(l), Sub,  Number(r)) => Ok(Number(l - r)),
+            (Number(l), Mul,  Number(r)) => Ok(Number(l * r)),
+            (Number(l), Div,  Number(r)) => Ok(Number(l / r)),
+            (Number(l), Pow,  Number(r)) => Ok(Number(l.powf(r))),
+
+            (String(l), Eq, String(r)) => Ok(Boolean(l == r)),
+            (String(l), NEq, String(r)) => Ok(Boolean(l != r)),
+            (String(l), Add, String(r)) => Ok(String(format!("{}{}", l, r))),
+
+            (Boolean(l), Eq, Boolean(r)) => Ok(Boolean(l == r)),
+            (Boolean(l), NEq, Boolean(r)) => Ok(Boolean(l != r)),
+
+            (String(_), Eq, Number(_)) => Ok(Boolean(false)),
+            (Number(_), Eq, String(_)) => Ok(Boolean(false)),
+
+            (Boolean(true), Or, _) => Ok(Boolean(true)),
+            (Number(l), Or, _) => Ok(Number(l)),
+            (String(l), Or, _) => Ok(String(l)),
+            (_, Or, Boolean(true)) => Ok(Boolean(true)),
+            (_, Or, String(r)) => Ok(String(r)),
+            (_, Or, Number(r)) => Ok(Number(r)),
+            (_, Or, _) => Ok(Boolean(false)),
+
+            (Boolean(false) | Nil, And, _) => Ok(Boolean(false)),
+            (_, And, Boolean(false) | Nil) => Ok(Boolean(false)),
+            (Boolean(true), And, Boolean(true)) => Ok(Boolean(true)),
+            (_, And, _) => Ok(Boolean(false)),
+
+
+            (String(_), Add, Number(_)) |
+            (Number(_), Add, String(_)) => Err(anyhow!("Operands must be two numbers or two strings")),
+            (_, Add | Sub | Mul | Div | Pow, _) => Err(anyhow!("Operands must be numbers")),
+            (_, Eq | NEq | LEq | GEq | L | G, _) => Err(anyhow!("Operands must be numbers")),
+        }
+    }
 }

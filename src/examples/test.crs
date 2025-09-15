@@ -1,7 +1,6 @@
-
-fun add(a: u8, b: u8) -> u32 {
-    let result = a + b;
-    let constant = 3 + 5;
+fun add(a: u32, b: u32) -> u32 {
+    let result: u32 = a + b;
+    let constant: u32 = 3 + 5;
     return constant;
 }
 
