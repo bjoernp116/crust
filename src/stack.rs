@@ -69,6 +69,7 @@ impl SymbolTable {
         &mut self,
         stmt: Statement,
         type_handler: &mut TypeHandler,
+        stack_info: &mut StackFrameInfo,
     ) -> anyhow::Result<()> {
         self.get_symbols(stmt, type_handler)?;
         // sort
@@ -76,8 +77,7 @@ impl SymbolTable {
             .table
             .clone()
             .into_iter()
-            .filter(|(k, v)| matches!(v.location, Location::Order(_)))
-            .map(|(k, v)| (k, v))
+            .filter(|(_, v)| matches!(v.location, Location::Order(_)))
             .collect();
 
         symbol_list.sort_by(|(_, v1), (_, v2)| {
@@ -87,12 +87,14 @@ impl SymbolTable {
         });
 
         for (ident, var) in symbol_list {
-            self.sum += var.variable_type.size as isize;
+            self.sum += 8; //var.variable_type.size as isize;
+            stack_info.push_var(ident.clone(), var.variable_type.size as u32);
             let entry: &mut Variable = self.table.get_mut(&ident).unwrap();
             entry.location = Location::Offset(-self.sum);
         }
         Ok(())
     }
+
     pub fn reserved(&self) -> usize {
         let quotient = self.sum as f32 / 16f32;
         let rounded: usize = quotient as usize + 1;
@@ -127,8 +129,8 @@ impl SymbolTable {
         if let Some(var) = self.table.get(ident) {
             match var.location.clone() {
                 Location::Offset(offset) => format!(
-                    "{} [rbp {}]",
-                    size_to_asm_word(var.variable_type.size),
+                    " [rbp {}]",
+                    //size_to_asm_word(var.variable_type.size),
                     offset
                 ),
                 Location::Register(reg) => format!("{}", reg),
@@ -217,5 +219,60 @@ impl SymbolTable {
             }
             _ => todo!(),
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct FuncStackFrame {
+    pub identifier: String,
+    pub start: u32,
+    pub frames: Vec<VarStackFrame>
+}
+
+impl FuncStackFrame {
+    pub fn size(&self) -> u32 {
+        self.frames.iter().map(|vf| vf.size).sum()
+    }
+}
+
+#[derive(Debug)]
+pub struct VarStackFrame {
+    pub identifier: String,
+    pub start: u32,
+    pub size: u32,
+}
+
+#[derive(Debug)]
+pub struct StackFrameInfo {
+    stack: Vec<FuncStackFrame>,
+}
+
+impl StackFrameInfo {
+    pub fn new() -> StackFrameInfo {
+        StackFrameInfo { stack: Vec::new() }
+    }
+    pub fn current_func_start(&self) -> u32 {
+        if let Some(last) = self.stack.last() {
+            last.start + last.size()
+        } else {
+            0
+        }
+    }
+    pub fn push_func(&mut self, identifier: String) {
+        let func = FuncStackFrame {
+            identifier,
+            start: self.current_func_start(),
+            frames: Vec::new()
+        };
+        self.stack.push(func)
+    }
+    pub fn push_var(&mut self, identifier: String, size: u32) {
+        let last = self.stack.last_mut().expect("Cant call push_var before push_func in StackFrameInfo!");
+        let var = VarStackFrame {
+            identifier,
+            size,
+            start: last.start + last.size(),
+        };
+        last.frames.push(var);
     }
 }

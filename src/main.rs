@@ -106,9 +106,13 @@ fn main() -> anyhow::Result<()> {
             let output_paths =
                 OutputPaths::new(args.file_path, args.output_dir)?;
             std::fs::write(&output_paths.asm_path, content)?;
+
             output_paths.assemble()?;
+            println!("ASSEMBLED");
             output_paths.link()?;
+            println!("LINKED");
             output_paths.run()?; 
+            println!("EXECUTED");
         }
         _ => todo!(),
     }
@@ -183,6 +187,7 @@ impl OutputPaths {
         Ok(())
     }
     fn run(&self) -> anyhow::Result<()> {
+        println!("EXE PATH: {:?}", self.exe_path);
         let result = std::process::Command::new(&self.exe_path).output()?;
         std::io::stdout().write_all(&result.stdout)?;
         std::io::stderr().write_all(&result.stderr)?;
@@ -192,5 +197,3 @@ impl OutputPaths {
         Ok(())
     }
 }
-
-

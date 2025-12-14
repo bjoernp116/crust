@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt::Display};
 use anyhow::anyhow;
 
 use crate::{
-    lexer::Position, parser::{BinaryOperator, Litteral, Node, Statement}, stack::SymbolTable, types::{Register, Type, TypeHandler}
+    lexer::Position, parser::{BinaryOperator, Litteral, Node, Statement}, stack::{FuncStackFrame, StackFrameInfo, SymbolTable}, types::{Register, Type, TypeHandler}
 };
 
 #[derive(Clone)]
@@ -19,6 +19,7 @@ pub struct Compiler {
     functions: HashMap<String, Function>,
     current_function: String,
     stack_size: isize,
+    stack_frames: StackFrameInfo,
 }
 
 impl Compiler {
@@ -31,6 +32,7 @@ impl Compiler {
             functions: HashMap::new(),
             current_function: String::new(),
             stack_size: 0,
+            stack_frames: StackFrameInfo::new()
         }
     }
     pub fn gen_binary_operator(&mut self, operator: BinaryOperator, t: Type) {
@@ -213,9 +215,10 @@ impl Compiler {
                     args.clone(),
                     ret.clone(),
                 )?;
+                self.stack_frames.push_func(identifier.clone());
                 self.symbol_table.push_args(args, &mut self.type_handler)?;
                 self.symbol_table
-                    .find_locals(*body.clone(), &mut self.type_handler)?;
+                    .find_locals(*body.clone(), &mut self.type_handler, &mut self.stack_frames)?;
                 println!("{:#?}", self.symbol_table);
                 self.push_header(format!("\n{}:", identifier));
                 self.stack_push("rbp");
@@ -259,6 +262,7 @@ impl Compiler {
         for statement in funcs {
             self.gen_statement(statement)?;
         }
+        println!("{:#?}", self.stack_frames);
         Ok(())
     }
 
