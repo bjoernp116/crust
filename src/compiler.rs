@@ -3,7 +3,10 @@ use std::{collections::HashMap, fmt::Display};
 use anyhow::anyhow;
 
 use crate::{
-    lexer::Position, parser::{BinaryOperator, Litteral, Node, Statement}, stack::{FuncStackFrame, StackFrameInfo, SymbolTable}, types::{Register, Type, TypeHandler}
+    lexer::Position,
+    parser::{BinaryOperator, Litteral, Node, Statement},
+    stack::{FuncStackFrame, Location, StackFrameInfo, SymbolTable},
+    types::{ARG_REGISTERS, REGISTER_STACK, Register, Type, TypeHandler},
 };
 
 #[derive(Clone)]
@@ -20,6 +23,7 @@ pub struct Compiler {
     current_function: String,
     stack_size: isize,
     stack_frames: StackFrameInfo,
+    expression_depth: usize,
 }
 
 impl Compiler {
@@ -32,24 +36,27 @@ impl Compiler {
             functions: HashMap::new(),
             current_function: String::new(),
             stack_size: 0,
-            stack_frames: StackFrameInfo::new()
+            stack_frames: StackFrameInfo::new(),
+            expression_depth: 0,
         }
     }
     pub fn gen_binary_operator(&mut self, operator: BinaryOperator, t: Type) {
         self.push(";; bin op");
         match operator {
             BinaryOperator::Add => {
+                self.expression_depth -= 1;
                 self.push(format!(
                     "add {}, {}",
-                    Register::A.with(t),
-                    Register::B.with(t)
+                    REGISTER_STACK[self.expression_depth - 1].with(t.clone()),
+                    REGISTER_STACK[self.expression_depth].with(t.clone())
                 ));
             }
             BinaryOperator::Sub => {
+                self.expression_depth -= 1;
                 self.push(format!(
                     "sub {}, {}",
-                    Register::A.with(t),
-                    Register::B.with(t)
+                    REGISTER_STACK[self.expression_depth - 1].with(t.clone()),
+                    REGISTER_STACK[self.expression_depth].with(t.clone())
                 ));
             }
             BinaryOperator::Mul => {
@@ -66,24 +73,47 @@ impl Compiler {
     pub fn gen_identifier(
         &mut self,
         identifier: String,
-        _: Option<Type>,
+        t: Option<Type>,
     ) -> anyhow::Result<Type> {
-        self.push(";; identifier");
-        let offset = self.symbol_table.get(&identifier);
-        self.push(format!("mov rax, {}", offset));
-        self.stack_push("rax");
+        let location = self.symbol_table.get_location(&identifier);
+        match location {
+            Location::Register(reg) => {
+                let t = t.unwrap_or(Type::default());
+                self.push(format!(
+                    "mov {}, {} ;; ident {}",
+                    REGISTER_STACK[self.expression_depth].with(t.clone()),
+                    reg.with(t),
+                    identifier
+                ));
+            }
+            Location::Offset(offset) => {
+                self.push(format!(
+                    "mov {}, [rbp {}] ;; ident {}",
+                    REGISTER_STACK[self.expression_depth]
+                        .with(t.unwrap_or(Type::default())),
+                    offset,
+                    identifier
+                ));
+            }
+            _ => unreachable!(),
+        }
+        self.expression_depth += 1;
         Ok(Type::default())
     }
 
     pub fn gen_litteral(&mut self, litteral: Litteral, t: Type) {
-        self.push(";; litteral");
         match litteral {
             Litteral::Number(n) => {
-                self.push(format!("mov {}, {}", Register::A.with(t), n));
-                self.stack_push("rax")
+                self.push(format!(
+                    "mov {}, {}\t\t;; lit {}",
+                    REGISTER_STACK[self.expression_depth].with(t.clone()),
+                    n,
+                    t.identifier
+                ));
             }
             _ => todo!(),
         }
+        self.expression_depth += 1;
     }
 
     pub fn gen_expr(
@@ -92,32 +122,30 @@ impl Compiler {
         t: Option<Type>,
     ) -> anyhow::Result<Type> {
         expr.optimize();
-        match expr {
+        let return_type = match expr {
             Node::Binary {
                 left,
                 operator,
                 right,
                 position: _,
             } => {
-                let a_type = self.gen_expr(*left, t)?;
-                let b_type = self.gen_expr(*right, t)?;
-                let typ = if let Some(variable_type) = t {
+                let a_type = self.gen_expr(*left, t.clone())?;
+                let b_type = self.gen_expr(*right, t.clone())?;
+                let t = if let Some(variable_type) = t {
                     variable_type
                 } else {
-                    Type {
-                        size: usize::max(a_type.size, b_type.size),
-                    }
+                    [a_type, b_type]
+                        .into_iter()
+                        .max_by(|a, b| a.size.cmp(&b.size))
+                        .unwrap()
                 };
-                self.stack_pop("rax");
-                self.stack_pop("rbx");
-                self.gen_binary_operator(operator, typ);
-                self.stack_push("rax");
-                Ok(typ)
+                self.gen_binary_operator(operator, t.clone());
+                Ok(t)
             }
             Node::Parenthesis(node) => self.gen_expr(*node, t),
             Node::Litteral(litteral, _) => {
                 if let Some(variable_type) = t {
-                    self.gen_litteral(litteral, variable_type);
+                    self.gen_litteral(litteral, variable_type.clone());
                     Ok(variable_type)
                 } else {
                     self.gen_litteral(litteral, Type::default());
@@ -129,7 +157,6 @@ impl Compiler {
             }
             Node::FuncIdentifier(identifier, args, _) => {
                 self.push(";; function identifier");
-                let arg_register = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
                 if !self.functions.contains_key(&identifier) {
                     return Err(anyhow!(
                         "Function {} not defined!",
@@ -138,33 +165,45 @@ impl Compiler {
                 }
                 let function = self.functions[&identifier].clone();
                 for (value, (_, t)) in
-                    args.into_iter().zip(function.args.clone())
+                    args.into_iter().zip(function.args.clone()).rev()
                 {
                     self.gen_expr(value, Some(t))?;
                 }
-                for (i, (_, _)) in function.args.iter().enumerate() {
-                    let register = arg_register[i];
-                    self.stack_pop(register);
+                for (i, (_, t)) in function.args.iter().enumerate().rev() {
+                    let register = ARG_REGISTERS[i].clone();
+                    println!("Expression depth: {}", self.expression_depth);
+                    self.push(format!(
+                        "mov {}, {}\t\t;; arg {}",
+                        register.with(t.clone()),
+                        REGISTER_STACK[self.expression_depth - 1]
+                            .with(t.clone()),
+                        i
+                    ));
+                    self.expression_depth -= 1;
+                }
+                if self.expression_depth != 0 {
+                    panic!("temporary values will be lost after call!");
                 }
                 self.push(format!("call {}", identifier));
-                if let Some(_) = function.ret {
-                    self.stack_push("rax");
-                }
+                self.expression_depth += 1;
                 if let Some(ret_type) = function.ret {
                     Ok(ret_type)
                 } else {
-                    Ok(Type { size: 0 })
+                    Ok(Type::default())
                 }
             }
             _ => todo!(),
-        }
+        };
+        return_type
     }
 
     pub fn gen_statement(&mut self, stmt: Statement) -> anyhow::Result<()> {
+        self.expression_depth = 0;
         match stmt {
             Statement::Exit(node) => {
                 self.push_header(";; exit");
                 self.gen_expr(node, None)?;
+                self.stack_push("rax");
                 self.push("mov rax, 60");
                 self.stack_pop("rdi");
                 self.push("syscall");
@@ -176,7 +215,7 @@ impl Compiler {
                 if let Some(expr) = node {
                     let function =
                         self.functions[&self.current_function].clone();
-                    let t = self.gen_expr(expr, function.ret)?;
+                    let t = self.gen_expr(expr, function.ret.clone())?;
                     match (function.ret, t) {
                         (Some(return_type), expr_type) => {
                             if return_type != expr_type {
@@ -189,19 +228,23 @@ impl Compiler {
                         _ => (),
                     }
                 }
-                self.stack_pop("rax");
                 self.push("mov rsp, rbp");
                 self.stack_pop("rbp");
                 self.push("ret");
                 self.push_header(";; /return");
             }
-            Statement::VarDecl(identifier, _, node) => {
-                self.push_header(";; variable decleration");
+            Statement::VarDecl(identifier, t, node) => {
+                self.push_header(format!(";; declare {}", identifier));
                 self.gen_expr(node, None)?;
-                let offset = self.symbol_table.get(&identifier);
-                self.stack_pop("rax");
-                self.push(format!("mov {}, rax", offset));
-                self.push_header(";; /variable decleration");
+                let offset = self.symbol_table.get_str(&identifier);
+                let t = self.type_handler.get(t.unwrap_or("u32".to_owned()))?;
+                self.expression_depth -= 1;
+                self.push(format!(
+                    "mov {}, {}",
+                    offset,
+                    REGISTER_STACK[self.expression_depth].with(t.clone())
+                ));
+                self.push_header(format!(";; /declare {}", identifier));
             }
             Statement::FuncDecl {
                 identifier,
@@ -209,6 +252,22 @@ impl Compiler {
                 ret,
                 body,
             } => {
+                if let Some(ret) = ret.clone() {
+                    self.push_header(format!(
+                        "\n;; {}({}) -> {}",
+                        identifier,
+                        args_format(args.clone()),
+                        ret
+                    ));
+                } else if args.len() == 0 {
+                    self.push_header("");
+                } else {
+                    self.push_header(format!(
+                        "\n;; {}({})",
+                        identifier,
+                        args_format(args.clone())
+                    ));
+                }
                 self.current_function = identifier.clone();
                 self.push_function(
                     identifier.clone(),
@@ -217,10 +276,13 @@ impl Compiler {
                 )?;
                 self.stack_frames.push_func(identifier.clone());
                 self.symbol_table.push_args(args, &mut self.type_handler)?;
-                self.symbol_table
-                    .find_locals(*body.clone(), &mut self.type_handler, &mut self.stack_frames)?;
+                self.symbol_table.find_locals(
+                    *body.clone(),
+                    &mut self.type_handler,
+                    &mut self.stack_frames,
+                )?;
                 println!("{:#?}", self.symbol_table);
-                self.push_header(format!("\n{}:", identifier));
+                self.push_header(format!("{}:", identifier));
                 self.stack_push("rbp");
                 self.push("mov rbp, rsp");
                 let reserved = self.symbol_table.reserved();
@@ -232,6 +294,7 @@ impl Compiler {
                     self.push("ret");
                 }
                 self.symbol_table.clear();
+                self.push_header(format!(";; /{}", identifier));
             }
             Statement::Block(stmts) => {
                 for statement in stmts {
@@ -254,6 +317,7 @@ impl Compiler {
         for statement in rest {
             self.gen_statement(statement)?;
         }
+        self.push("sub rsp, 8");
         self.push("call main");
         self.push("mov rax, 60");
         self.push("mov rdi, 0");
@@ -304,7 +368,9 @@ impl Compiler {
     }
 
     fn push_header(&mut self, line: impl Into<String>) {
-        self.assembly.push_str(&line.into());
+        let string = line.into();
+        println!("{}", string);
+        self.assembly.push_str(&string);
         self.assembly.push('\n');
     }
 }
@@ -341,7 +407,12 @@ fn filter_function_statements(
 impl Node {
     pub fn optimize(&mut self) {
         match self {
-            Node::Binary { left, right, operator, position } => {
+            Node::Binary {
+                left,
+                right,
+                operator,
+                position,
+            } => {
                 let mut left = *left.clone();
                 let mut right = *right.clone();
                 left.optimize();
@@ -349,37 +420,40 @@ impl Node {
                 match (left, right) {
                     (Node::Litteral(l, _), Node::Litteral(r, _)) => {
                         if let Ok(optimized) = operator.eval(l, r) {
-                            *self = Node::Litteral(optimized, position.clone()); 
+                            *self = Node::Litteral(optimized, position.clone());
                         }
                     }
-                    _ => ()
+                    _ => (),
                 }
-            },
+            }
             Node::Parenthesis(node) => node.optimize(),
-            _ => ()
+            _ => (),
         }
     }
 }
 
-
 impl BinaryOperator {
-    fn eval(&self, left: Litteral, right: Litteral) -> anyhow::Result<Litteral> {
-        use Litteral::*;
+    fn eval(
+        &self,
+        left: Litteral,
+        right: Litteral,
+    ) -> anyhow::Result<Litteral> {
         use BinaryOperator::*;
+        use Litteral::*;
 
         match (left.clone(), self, right.clone()) {
-            (Number(l), Eq,  Number(r)) => Ok(Boolean(l == r)),
-            (Number(l), NEq,  Number(r)) => Ok(Boolean(l != r)),
-            (Number(l), LEq,  Number(r)) => Ok(Boolean(l <= r)),
-            (Number(l), GEq,  Number(r)) => Ok(Boolean(l >= r)),
-            (Number(l), L,  Number(r)) => Ok(Boolean(l < r)),
-            (Number(l), G,  Number(r)) => Ok(Boolean(l > r)),
+            (Number(l), Eq, Number(r)) => Ok(Boolean(l == r)),
+            (Number(l), NEq, Number(r)) => Ok(Boolean(l != r)),
+            (Number(l), LEq, Number(r)) => Ok(Boolean(l <= r)),
+            (Number(l), GEq, Number(r)) => Ok(Boolean(l >= r)),
+            (Number(l), L, Number(r)) => Ok(Boolean(l < r)),
+            (Number(l), G, Number(r)) => Ok(Boolean(l > r)),
 
-            (Number(l), Add,  Number(r)) => Ok(Number(l + r)),
-            (Number(l), Sub,  Number(r)) => Ok(Number(l - r)),
-            (Number(l), Mul,  Number(r)) => Ok(Number(l * r)),
-            (Number(l), Div,  Number(r)) => Ok(Number(l / r)),
-            (Number(l), Pow,  Number(r)) => Ok(Number(l.powf(r))),
+            (Number(l), Add, Number(r)) => Ok(Number(l + r)),
+            (Number(l), Sub, Number(r)) => Ok(Number(l - r)),
+            (Number(l), Mul, Number(r)) => Ok(Number(l * r)),
+            (Number(l), Div, Number(r)) => Ok(Number(l / r)),
+            (Number(l), Pow, Number(r)) => Ok(Number(l.powf(r))),
 
             (String(l), Eq, String(r)) => Ok(Boolean(l == r)),
             (String(l), NEq, String(r)) => Ok(Boolean(l != r)),
@@ -404,11 +478,25 @@ impl BinaryOperator {
             (Boolean(true), And, Boolean(true)) => Ok(Boolean(true)),
             (_, And, _) => Ok(Boolean(false)),
 
-
-            (String(_), Add, Number(_)) |
-            (Number(_), Add, String(_)) => Err(anyhow!("Operands must be two numbers or two strings")),
-            (_, Add | Sub | Mul | Div | Pow, _) => Err(anyhow!("Operands must be numbers")),
-            (_, Eq | NEq | LEq | GEq | L | G, _) => Err(anyhow!("Operands must be numbers")),
+            (String(_), Add, Number(_)) | (Number(_), Add, String(_)) => {
+                Err(anyhow!("Operands must be two numbers or two strings"))
+            }
+            (_, Add | Sub | Mul | Div | Pow, _) => {
+                Err(anyhow!("Operands must be numbers"))
+            }
+            (_, Eq | NEq | LEq | GEq | L | G, _) => {
+                Err(anyhow!("Operands must be numbers"))
+            }
         }
     }
+}
+
+fn args_format(args: Vec<(String, String)>) -> String {
+    let mut result = String::new();
+    for (ident, t) in args {
+        result.push_str(format!("{}: {}, ", ident, t).as_str());
+    }
+    result.pop();
+    result.pop();
+    result
 }

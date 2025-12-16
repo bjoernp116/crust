@@ -1,15 +1,15 @@
 use crate::{
     parser::{Litteral, Node, Statement},
-    types::{Type, TypeHandler},
+    types::{ARG_REGISTERS, Register, Type, TypeHandler},
 };
 use std::collections::HashMap;
 
 use anyhow::anyhow;
 
 #[derive(Debug, Clone)]
-enum Location {
+pub enum Location {
     Offset(isize),
-    Register(String),
+    Register(Register),
     Order(usize),
 }
 
@@ -26,7 +26,7 @@ impl Location {
         }
         unreachable!()
     }
-    pub fn unwrap_register(&self) -> String {
+    pub fn unwrap_register(&self) -> Register {
         if let Location::Register(reg) = &self {
             return reg.clone();
         }
@@ -108,12 +108,11 @@ impl SymbolTable {
         if args.len() > 6 {
             return Err(anyhow!("More than 6 args not supported yet!"));
         }
-        let arg_register = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
         for (i, (ident, typename)) in args.into_iter().enumerate() {
             let var_type = type_handler.get(typename)?;
             let var = Variable {
-                location: Location::Register(arg_register[i].to_owned()),
-                variable_type: *var_type,
+                location: Location::Register(ARG_REGISTERS[i].to_owned()),
+                variable_type: var_type.clone(),
                 explicit_type: true,
                 argument: true,
             };
@@ -125,17 +124,26 @@ impl SymbolTable {
         self.sum = 0;
         self.table.clear();
     }
-    pub fn get(&self, ident: &String) -> String {
+    pub fn get_str(&self, ident: &String) -> String {
         if let Some(var) = self.table.get(ident) {
             match var.location.clone() {
                 Location::Offset(offset) => format!(
-                    " [rbp {}]",
+                    "[rbp {}]",
                     //size_to_asm_word(var.variable_type.size),
                     offset
                 ),
-                Location::Register(reg) => format!("{}", reg),
+                Location::Register(reg) => {
+                    format!("{}", reg.with(var.variable_type.clone()))
+                }
                 Location::Order(_) => panic!("variable unordered!"),
             }
+        } else {
+            panic!("{} not defined!", ident)
+        }
+    }
+    pub fn get_location(&self, ident: &String) -> Location {
+        if let Some(var) = self.table.get(ident) {
+            var.location.clone()
         } else {
             panic!("{} not defined!", ident)
         }
@@ -206,13 +214,13 @@ impl SymbolTable {
                         ..4294967296.0 => type_handler.get("u32".to_owned())?,
                         _ => type_handler.get("u64".to_owned())?,
                     };
-                    Ok((*t, false))
+                    Ok((t.clone(), false))
                 }
                 _ => todo!(),
             },
             Node::Identifier(ident, _) => {
                 if let Some(var) = self.table.get(&ident) {
-                    Ok((var.variable_type, true))
+                    Ok((var.variable_type.clone(), true))
                 } else {
                     Err(anyhow!("Undefined variable: {}", ident))
                 }
@@ -226,7 +234,7 @@ impl SymbolTable {
 pub struct FuncStackFrame {
     pub identifier: String,
     pub start: u32,
-    pub frames: Vec<VarStackFrame>
+    pub frames: Vec<VarStackFrame>,
 }
 
 impl FuncStackFrame {
@@ -262,12 +270,15 @@ impl StackFrameInfo {
         let func = FuncStackFrame {
             identifier,
             start: self.current_func_start(),
-            frames: Vec::new()
+            frames: Vec::new(),
         };
         self.stack.push(func)
     }
     pub fn push_var(&mut self, identifier: String, size: u32) {
-        let last = self.stack.last_mut().expect("Cant call push_var before push_func in StackFrameInfo!");
+        let last = self
+            .stack
+            .last_mut()
+            .expect("Cant call push_var before push_func in StackFrameInfo!");
         let var = VarStackFrame {
             identifier,
             size,
