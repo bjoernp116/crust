@@ -3,10 +3,9 @@ use std::{collections::HashMap, fmt::Display};
 use anyhow::anyhow;
 
 use crate::{
-    lexer::Position,
     parser::{BinaryOperator, Litteral, Node, Statement},
-    stack::{FuncStackFrame, Location, StackFrameInfo, SymbolTable},
-    types::{ARG_REGISTERS, REGISTER_STACK, Register, Type, TypeHandler},
+    stack::{Location, StackFrameInfo, TempAllocator},
+    types::{ARG_REGISTERS, REGISTER_STACK, Type, TypeHandler},
 };
 
 #[derive(Clone)]
@@ -18,12 +17,11 @@ pub struct Function {
 pub struct Compiler {
     assembly: String,
     type_handler: TypeHandler,
-    symbol_table: SymbolTable,
     functions: HashMap<String, Function>,
     current_function: String,
     stack_size: isize,
     stack_frames: StackFrameInfo,
-    expression_depth: usize,
+    temp_allocator: TempAllocator,
 }
 
 impl Compiler {
@@ -32,31 +30,30 @@ impl Compiler {
         Self {
             assembly,
             type_handler: TypeHandler::new(),
-            symbol_table: SymbolTable::new(),
             functions: HashMap::new(),
             current_function: String::new(),
             stack_size: 0,
             stack_frames: StackFrameInfo::new(),
-            expression_depth: 0,
+            temp_allocator: TempAllocator::new(),
         }
     }
     pub fn gen_binary_operator(&mut self, operator: BinaryOperator, t: Type) {
         self.push(";; bin op");
         match operator {
             BinaryOperator::Add => {
-                self.expression_depth -= 1;
+                self.temp_allocator -= 1;
                 self.push(format!(
                     "add {}, {}",
-                    REGISTER_STACK[self.expression_depth - 1].with(t.clone()),
-                    REGISTER_STACK[self.expression_depth].with(t.clone())
+                    self.temp_allocator.get(t.clone(), -1),
+                    self.temp_allocator.get(t.clone(), 0),
                 ));
             }
             BinaryOperator::Sub => {
-                self.expression_depth -= 1;
+                self.temp_allocator -= 1;
                 self.push(format!(
                     "sub {}, {}",
-                    REGISTER_STACK[self.expression_depth - 1].with(t.clone()),
-                    REGISTER_STACK[self.expression_depth].with(t.clone())
+                    self.temp_allocator.get(t.clone(), -1),
+                    self.temp_allocator.get(t.clone(), 0),
                 ));
             }
             BinaryOperator::Mul => {
@@ -75,13 +72,14 @@ impl Compiler {
         identifier: String,
         t: Option<Type>,
     ) -> anyhow::Result<Type> {
-        let location = self.symbol_table.get_location(&identifier);
+        let location =
+            self.temp_allocator.symbol_table.get_location(&identifier);
         match location {
             Location::Register(reg) => {
                 let t = t.unwrap_or(Type::default());
                 self.push(format!(
                     "mov {}, {} ;; ident {}",
-                    REGISTER_STACK[self.expression_depth].with(t.clone()),
+                    self.temp_allocator.get(t.clone(), 0),
                     reg.with(t),
                     identifier
                 ));
@@ -89,15 +87,15 @@ impl Compiler {
             Location::Offset(offset) => {
                 self.push(format!(
                     "mov {}, [rbp {}] ;; ident {}",
-                    REGISTER_STACK[self.expression_depth]
-                        .with(t.unwrap_or(Type::default())),
+                    self.temp_allocator
+                        .get(t.clone().unwrap_or(Type::default()), 0),
                     offset,
                     identifier
                 ));
             }
             _ => unreachable!(),
         }
-        self.expression_depth += 1;
+        self.temp_allocator += 1;
         Ok(Type::default())
     }
 
@@ -106,14 +104,14 @@ impl Compiler {
             Litteral::Number(n) => {
                 self.push(format!(
                     "mov {}, {}\t\t;; lit {}",
-                    REGISTER_STACK[self.expression_depth].with(t.clone()),
+                    self.temp_allocator.get(t.clone(), 0),
                     n,
                     t.identifier
                 ));
             }
             _ => todo!(),
         }
-        self.expression_depth += 1;
+        self.temp_allocator += 1;
     }
 
     pub fn gen_expr(
@@ -171,21 +169,23 @@ impl Compiler {
                 }
                 for (i, (_, t)) in function.args.iter().enumerate().rev() {
                     let register = ARG_REGISTERS[i].clone();
-                    println!("Expression depth: {}", self.expression_depth);
+                    println!(
+                        "Expression depth: {}",
+                        self.temp_allocator.expression_depth
+                    );
                     self.push(format!(
                         "mov {}, {}\t\t;; arg {}",
                         register.with(t.clone()),
-                        REGISTER_STACK[self.expression_depth - 1]
-                            .with(t.clone()),
+                        self.temp_allocator.get(t.clone(), -1),
                         i
                     ));
-                    self.expression_depth -= 1;
+                    self.temp_allocator -= 1;
                 }
-                if self.expression_depth != 0 {
+                if self.temp_allocator.expression_depth != 0 {
                     panic!("temporary values will be lost after call!");
                 }
                 self.push(format!("call {}", identifier));
-                self.expression_depth += 1;
+                self.temp_allocator += 1;
                 if let Some(ret_type) = function.ret {
                     Ok(ret_type)
                 } else {
@@ -198,7 +198,7 @@ impl Compiler {
     }
 
     pub fn gen_statement(&mut self, stmt: Statement) -> anyhow::Result<()> {
-        self.expression_depth = 0;
+        self.temp_allocator.expression_depth = 0;
         match stmt {
             Statement::Exit(node) => {
                 self.push_header(";; exit");
@@ -236,13 +236,13 @@ impl Compiler {
             Statement::VarDecl(identifier, t, node) => {
                 self.push_header(format!(";; declare {}", identifier));
                 self.gen_expr(node, None)?;
-                let offset = self.symbol_table.get_str(&identifier);
+                let offset = self.temp_allocator.declare_variable(&identifier);
                 let t = self.type_handler.get(t.unwrap_or("u32".to_owned()))?;
-                self.expression_depth -= 1;
+                self.temp_allocator.expression_depth -= 1;
                 self.push(format!(
                     "mov {}, {}",
                     offset,
-                    REGISTER_STACK[self.expression_depth].with(t.clone())
+                    self.temp_allocator.get(t.clone(), 0)
                 ));
                 self.push_header(format!(";; /declare {}", identifier));
             }
@@ -275,17 +275,20 @@ impl Compiler {
                     ret.clone(),
                 )?;
                 self.stack_frames.push_func(identifier.clone());
-                self.symbol_table.push_args(args, &mut self.type_handler)?;
-                self.symbol_table.find_locals(
+                self.temp_allocator
+                    .push_args(args, &mut self.type_handler)?;
+                self.temp_allocator.find_locals(
                     *body.clone(),
                     &mut self.type_handler,
                     &mut self.stack_frames,
                 )?;
-                println!("{:#?}", self.symbol_table);
+                self.temp_allocator.find_max_spills(&body);
+                println!("{:#?}", self.temp_allocator.symbol_table);
+                println!("{:#?}", self.temp_allocator.total_stack_size());
                 self.push_header(format!("{}:", identifier));
                 self.stack_push("rbp");
                 self.push("mov rbp, rsp");
-                let reserved = self.symbol_table.reserved();
+                let reserved = self.temp_allocator.total_stack_size();
                 self.push(format!("sub rsp, {}", reserved));
                 self.gen_statement(*body)?;
                 if let None = ret {
@@ -293,7 +296,7 @@ impl Compiler {
                     self.stack_pop("rbp");
                     self.push("ret");
                 }
-                self.symbol_table.clear();
+                self.temp_allocator.symbol_table.clear();
                 self.push_header(format!(";; /{}", identifier));
             }
             Statement::Block(stmts) => {

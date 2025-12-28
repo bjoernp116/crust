@@ -4,5 +4,5 @@ fun average(a: u32, b: u32) -> u32 {
 }
 
 fun main() { 
-    exit(average(6, 7) + 3);
+    exit(average(6, 7));
 }

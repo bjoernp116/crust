@@ -1,8 +1,12 @@
 use crate::{
     parser::{Litteral, Node, Statement},
-    types::{ARG_REGISTERS, Register, Type, TypeHandler},
+    types::{ARG_REGISTERS, REGISTER_STACK, Register, Type, TypeHandler},
 };
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    ops::{AddAssign, SubAssign},
+    process::id,
+};
 
 use anyhow::anyhow;
 
@@ -96,9 +100,7 @@ impl SymbolTable {
     }
 
     pub fn reserved(&self) -> usize {
-        let quotient = self.sum as f32 / 16f32;
-        let rounded: usize = quotient as usize + 1;
-        rounded * 16usize
+        round_up(self.sum as usize, 16)
     }
     pub fn push_args(
         &mut self,
@@ -286,4 +288,148 @@ impl StackFrameInfo {
         };
         last.frames.push(var);
     }
+}
+
+#[derive(Debug)]
+pub struct TempAllocator {
+    pub symbol_table: SymbolTable,
+    max_spills: usize,
+    func_ident: usize,
+    pub expression_depth: usize,
+}
+
+impl TempAllocator {
+    pub fn new() -> Self {
+        Self {
+            max_spills: 0,
+            func_ident: 0,
+            expression_depth: 0,
+            symbol_table: SymbolTable::new(),
+        }
+    }
+    pub fn declare_variable(&self, identifier: &String) -> String {
+        self.symbol_table.get_str(identifier)
+    }
+    pub fn find_locals(
+        &mut self,
+        stmt: Statement,
+        type_handler: &mut TypeHandler,
+        stack_info: &mut StackFrameInfo,
+    ) -> anyhow::Result<()> {
+        self.symbol_table
+            .find_locals(stmt, type_handler, stack_info)
+    }
+    pub fn push_args(
+        &mut self,
+        args: Vec<(String, String)>,
+        type_handler: &mut TypeHandler,
+    ) -> anyhow::Result<()> {
+        self.symbol_table.push_args(args, type_handler)
+    }
+    pub fn get(&self, t: Type, idx_ofst: isize) -> String {
+        if self.expression_depth <= self.func_ident {
+            let offset = self.expression_depth * 16;
+            //assert!(offset <= self.spill_size());
+            format!("[rbp - {}]", offset + self.symbol_table.reserved())
+        } else {
+            REGISTER_STACK[(self.expression_depth as isize + idx_ofst) as usize]
+                .with(t)
+        }
+    }
+    pub fn total_stack_size(&self) -> usize {
+        let locals_size = self.symbol_table.reserved();
+        println!("{}", locals_size);
+        let spill_size = self.spill_size();
+        println!("{}", spill_size);
+        round_up(spill_size + locals_size, 16)
+    }
+    pub fn spill_size(&self) -> usize {
+        let spill_size = self.max_spills * 8;
+        round_up(spill_size, 16)
+    }
+    pub fn find_max_spills(&mut self, stmt: &Statement) {
+        self.max_spills = self.stmt_spills(stmt.clone());
+    }
+    pub fn stmt_spills(&mut self, stmt: Statement) -> usize {
+        match stmt {
+            Statement::VarDecl(_, _, expr) => self.spills(expr),
+            Statement::Exit(expr) => self.spills(expr),
+            Statement::Return(Some(expr)) => self.spills(expr),
+            Statement::Block(stmts) => stmts
+                .into_iter()
+                .map(|stmt| self.stmt_spills(stmt))
+                .max()
+                .unwrap_or(0),
+            _ => {
+                todo!()
+            }
+        }
+    }
+    fn spills(&mut self, expr: Node) -> usize {
+        match expr {
+            Node::Binary {
+                left,
+                right,
+                operator: _,
+                position: _,
+            } => {
+                println!(
+                    "lc: {}, rc: {}",
+                    Self::contains_call(&left),
+                    Self::contains_call(&right)
+                );
+                match (Self::contains_call(&left), Self::contains_call(&right))
+                {
+                    (true, true) => {
+                        usize::max(self.spills(*left), self.spills(*right) + 1)
+                    }
+                    (true, false) => self.spills(*left),
+                    (false, true) => usize::max(self.spills(*right), 1),
+                    (false, false) => 0,
+                }
+            }
+            Node::Parenthesis(expr) => self.spills(*expr),
+            Node::Litteral(_, _) => 0,
+            Node::Identifier(_, _) => 0,
+            Node::Unary(_, expr, _) => self.spills(*expr),
+            Node::FuncIdentifier(_, args, _) => {
+                self.func_ident += 1;
+                args.into_iter()
+                    .map(|stmt| self.spills(stmt))
+                    .max()
+                    .unwrap_or(0)
+            }
+            _ => todo!(),
+        }
+    }
+
+    fn contains_call(expr: &Node) -> bool {
+        match expr {
+            Node::Binary {
+                left,
+                right,
+                operator: _,
+                position: _,
+            } => Self::contains_call(left) | Self::contains_call(right),
+            Node::FuncIdentifier(_, _, _) => true,
+            Node::Unary(_, expr, _) => Self::contains_call(expr),
+            _ => false,
+        }
+    }
+}
+
+impl AddAssign<usize> for TempAllocator {
+    fn add_assign(&mut self, rhs: usize) {
+        self.expression_depth += rhs
+    }
+}
+impl SubAssign<usize> for TempAllocator {
+    fn sub_assign(&mut self, rhs: usize) {
+        self.expression_depth -= rhs
+    }
+}
+
+fn round_up(float: usize, to: usize) -> usize {
+    let quotient = float as f32 / to as f32;
+    quotient.ceil() as usize * to
 }
