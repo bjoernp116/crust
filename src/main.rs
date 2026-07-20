@@ -1,14 +1,21 @@
+mod chunks;
 mod compiler;
+mod error;
+mod functions;
 mod lexer;
 mod parser;
 mod stack;
+mod symbols;
 mod types;
 use anyhow::anyhow;
 use clap::{Parser, ValueEnum};
-use compiler::Compiler;
-use std::{fs::read_to_string, path::PathBuf};
+//use compiler::Compiler;
 use std::io::Write;
+use std::{fs::read_to_string, path::PathBuf};
 
+use crate::error::{ResResult, unwrap_print};
+use crate::types::{TypeHandler, Typer};
+//use crate::chunks::IR;
 use crate::{
     lexer::{Token, TokenType},
     parser::AstFactory,
@@ -38,6 +45,8 @@ enum Command {
     Parse,
     #[clap(name = "evaluate", alias = "e")]
     Evaluate,
+    #[clap(name = "IR", alias = "ir")]
+    IR,
     #[clap(name = "compile", alias = "c")]
     Compile,
     #[clap(name = "run", alias = "r")]
@@ -47,14 +56,10 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     let args = CLI::parse();
 
-    let file_contents: String = if let Ok(fc) = read_to_string(&args.file_path)
-    {
+    let file_contents: String = if let Ok(fc) = read_to_string(&args.file_path) {
         fc.to_owned()
     } else {
-        return Err(anyhow!(
-            "Failed to read file {}",
-            args.file_path.display()
-        ));
+        return Err(anyhow!("Failed to read file {}", args.file_path.display()));
     };
 
     match args.command {
@@ -80,39 +85,60 @@ fn main() -> anyhow::Result<()> {
                 }
             };
         }
-        Command::Compile => {
-            let tokens: Vec<Token> = lexer::scan(file_contents)?;
+        Command::IR => {
+            let tokens: Vec<Token> = lexer::scan(file_contents.clone())?;
 
             let mut ast = AstFactory::new(tokens);
             let statements = ast.parse_statements()?;
-            let mut compiler = Compiler::new();
-            compiler.gen_program(statements)?;
-            println!("{}", compiler);
-            let content = format!("{}", compiler);
-            let output_paths =
-                OutputPaths::new(args.file_path, args.output_dir)?;
-            std::fs::write(&output_paths.asm_path, content)?;
-            output_paths.assemble()?;
-            output_paths.link()?;
+
+            let mut typer = Typer::new();
+            let mut type_handler = TypeHandler::new();
+            let typed_ast = unwrap_print(
+                typer.resolve_stmts(statements, &mut type_handler),
+                &file_contents,
+                &type_handler
+            );
+            println!("{:#?}", typed_ast);
+            println!("{:#?}", typer);
         }
-        Command::Run => {
-            let tokens: Vec<Token> = lexer::scan(file_contents)?;
+        Command::Compile => {
+            todo!()
+            /*
+                let tokens: Vec<Token> = lexer::scan(file_contents)?;
 
-            let mut ast = AstFactory::new(tokens);
-            let statements = ast.parse_statements()?;
-            let mut compiler = Compiler::new();
-            compiler.gen_program(statements)?;
-            let content = format!("{}", compiler);
-            let output_paths =
-                OutputPaths::new(args.file_path, args.output_dir)?;
-            std::fs::write(&output_paths.asm_path, content)?;
+                let mut ast = AstFactory::new(tokens);
+                let statements = ast.parse_statements()?;
+                let mut ir = IR::new(statements);
+                ir.optimize();
+                println!("{}", ir);
+                let mut compiler = Compiler::new(ir);
+                let content = compiler.compile();
+                let output_paths =
+                    OutputPaths::new(args.file_path, args.output_dir)?;
+                std::fs::write(&output_paths.asm_path, content)?;
+                output_paths.assemble()?;
+                output_paths.link()?;
+            }
+            Command::Run => {
+                let tokens: Vec<Token> = lexer::scan(file_contents)?;
 
-            output_paths.assemble()?;
-            println!("ASSEMBLED");
-            output_paths.link()?;
-            println!("LINKED");
-            output_paths.run()?; 
-            println!("EXECUTED");
+                let mut ast = AstFactory::new(tokens);
+                let statements = ast.parse_statements()?;
+                let ir = IR::new(statements);
+                let mut compiler = Compiler::new(ir);
+                let content = compiler.compile();
+                let output_paths =
+                    OutputPaths::new(args.file_path, args.output_dir)?;
+                println!("{:#?}", output_paths);
+                std::fs::write(&output_paths.asm_path, content)?;
+
+                output_paths.assemble()?;
+                println!("ASSEMBLED");
+                output_paths.link()?;
+                println!("LINKED");
+                output_paths.run()?;
+                println!("EXECUTED");
+                */
         }
         _ => todo!(),
     }
@@ -120,6 +146,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
 struct OutputPaths {
     source_path: PathBuf,
     obj_path: PathBuf,
@@ -127,10 +154,7 @@ struct OutputPaths {
     exe_path: PathBuf,
 }
 impl OutputPaths {
-    fn new(
-        source_path: PathBuf,
-        output_dir: Option<PathBuf>,
-    ) -> anyhow::Result<OutputPaths> {
+    fn new(source_path: PathBuf, output_dir: Option<PathBuf>) -> anyhow::Result<OutputPaths> {
         let directory: PathBuf = if let Some(out_path) = output_dir {
             if out_path.is_dir() {
                 out_path
@@ -191,7 +215,7 @@ impl OutputPaths {
         let result = std::process::Command::new(&self.exe_path).output()?;
         std::io::stdout().write_all(&result.stdout)?;
         std::io::stderr().write_all(&result.stderr)?;
-        
+
         println!("{}", result.status);
 
         Ok(())

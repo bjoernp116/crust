@@ -7,3 +7,4 @@ edition = "2024"
 anyhow = "1.0.99"
 clap = { version = "4.5.35", features = ["derive"] }
 clap_derive = "4.5.47"
+colored = "3.1.1"

@@ -1,8 +1,16 @@
-fun average(a: u32, b: u32) -> u32 {
-    let sum: u32 = a + b;
-    return sum - 2;
+fun main() -> u16 { 
+    let sum = add(3, 4);
+    sum = sum + 1;
+
+    let predicate = sum == 5;
+
+    if (predicate) {
+        return predicate;
+    }
+
+    return sum;
 }
 
-fun main() { 
-    exit(average(6, 7));
+fun add(a: u16, b: u16) -> u16 {
+    return a + b;
 }

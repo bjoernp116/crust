@@ -1,9 +1,15 @@
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct Position {
     pub from: (usize, usize),
     pub to: (usize, usize),
+}
+
+impl Debug for Position {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Ok(())
+    }
 }
 
 impl Position {
@@ -26,6 +32,12 @@ impl Position {
     }
     pub fn line(&self) -> usize {
         self.to.0
+    }
+}
+
+impl Display for Position {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{} - {}:{}", self.from.0, self.from.1, self.to.0, self.to.1)
     }
 }
 

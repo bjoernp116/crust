@@ -1,9 +1,6 @@
 use std::{collections::VecDeque, fmt::Display};
 
-use crate::{
-    lexer::Position,
-    lexer::{Token, TokenType},
-};
+use crate::lexer::{Position, Token, TokenType};
 use anyhow::anyhow;
 
 #[derive(Clone)]
@@ -40,6 +37,7 @@ impl Node {
             Self::Assignment(_, _, pos) => pos.clone(),
         }
     }
+
 }
 
 #[derive(Clone)]
@@ -140,7 +138,7 @@ impl std::fmt::Debug for Litteral {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum UnaryOperator {
     Not,
     Neg,
@@ -155,7 +153,7 @@ impl Display for UnaryOperator {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug)]
 pub enum BinaryOperator {
     Add,
     Sub,
@@ -172,6 +170,37 @@ pub enum BinaryOperator {
 
     Or,
     And,
+}
+
+impl BinaryOperator {
+    pub fn is_boolean_out(&self) -> bool {
+        use BinaryOperator::*;
+        match self {
+            Eq | NEq | G | GEq | L | LEq | Or | And => true,
+            _ => false
+        }
+    }
+    pub fn is_numerical_out(&self) -> bool {
+        use BinaryOperator::*;
+        match self {
+            Eq | NEq | G | GEq | L | LEq | Or | And => false,
+            _ => true 
+        }
+    }
+    pub fn is_boolean_in(&self) -> bool {
+        use BinaryOperator::*;
+        match self {
+            And | Or => true,
+            _ => false
+        }
+    }
+    pub fn is_numerical_in(&self) -> bool {
+        use BinaryOperator::*;
+        match self {
+            And | Or => false,
+            _ => true 
+        }
+    }
 }
 
 impl Display for BinaryOperator {
@@ -421,7 +450,6 @@ impl AstFactory {
                     ));
                 }
                 self.current += 1;
-                println!("body");
                 let body = Box::new(self.parse_statement()?);
 
                 Ok(Statement::For(None, None, None, body))
@@ -807,7 +835,6 @@ impl AstFactory {
         loop {
             let prev = self.tokens[self.current - 1].token_type.clone();
             let curr = self.tokens[self.current].token_type.clone();
-            println!("{:?}, {:?}", prev, curr);
             match (prev, curr) {
                 (_, TokenType::RightParen) => {
                     self.current += 1;

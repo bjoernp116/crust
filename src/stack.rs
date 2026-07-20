@@ -1,3 +1,4 @@
+/*
 use crate::{
     parser::{Litteral, Node, Statement},
     types::{ARG_REGISTERS, REGISTER_STACK, Register, Type, TypeHandler},
@@ -5,7 +6,6 @@ use crate::{
 use std::{
     collections::HashMap,
     ops::{AddAssign, SubAssign},
-    process::id,
 };
 
 use anyhow::anyhow;
@@ -433,3 +433,4 @@ fn round_up(float: usize, to: usize) -> usize {
     let quotient = float as f32 / to as f32;
     quotient.ceil() as usize * to
 }
+*/
