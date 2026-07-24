@@ -31,13 +31,13 @@ impl FuncTable {
         id
     }
 
-    pub fn get(&self, id: FuncID) -> &FuncSignature {
+    pub fn get(&self, id: &FuncID) -> &FuncSignature {
         &self.functions[id.0]
     }
     
     pub fn current(&self) -> Option<&FuncSignature> {
         if let Some(id) = self.current {
-            Some(self.get(id))
+            Some(self.get(&id))
         } else {
             None
         }

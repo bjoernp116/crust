@@ -1,16 +1,9 @@
-fun main() -> u16 { 
-    let sum = add(3, 4);
-    sum = sum + 1;
-
-    let predicate = sum == 5;
-
-    if (predicate) {
-        return predicate;
-    }
-
-    return sum;
+fun main() -> u16 {
+    let x: u16 = 4;
+    let y: u16 = 3;
+    x + y
 }
 
-fun add(a: u16, b: u16) -> u16 {
-    return a + b;
+fun add() -> u16 {
+    return 0;
 }

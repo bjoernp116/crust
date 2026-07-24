@@ -1,9 +1,11 @@
+mod asm;
 mod chunks;
 mod compiler;
 mod error;
 mod functions;
 mod lexer;
 mod parser;
+mod ssa;
 mod stack;
 mod symbols;
 mod types;
@@ -13,7 +15,9 @@ use clap::{Parser, ValueEnum};
 use std::io::Write;
 use std::{fs::read_to_string, path::PathBuf};
 
-use crate::error::{ResResult, unwrap_print};
+use crate::asm::AsmWriter;
+use crate::error::{print_err, unwrap_print};
+use crate::ssa::SSA;
 use crate::types::{TypeHandler, Typer};
 //use crate::chunks::IR;
 use crate::{
@@ -45,8 +49,10 @@ enum Command {
     Parse,
     #[clap(name = "evaluate", alias = "e")]
     Evaluate,
-    #[clap(name = "IR", alias = "ir")]
-    IR,
+    #[clap(name = "resolve", alias = "res")]
+    Resolve,
+    #[clap(name = "ssa")]
+    SSA,
     #[clap(name = "compile", alias = "c")]
     Compile,
     #[clap(name = "run", alias = "r")]
@@ -75,70 +81,99 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Parse => {
-            let tokens: Vec<Token> = lexer::scan(file_contents)?;
+            let tokens: Vec<Token> = lexer::scan(file_contents.clone())?;
 
             let mut ast = AstFactory::new(tokens);
             match ast.parse_statements() {
                 Ok(h) => println!("{:#?}", h),
                 Err(e) => {
-                    eprintln!("{}", e);
+                    print_err(e, &file_contents, &TypeHandler::new());
                 }
             };
         }
-        Command::IR => {
+        Command::Resolve => {
             let tokens: Vec<Token> = lexer::scan(file_contents.clone())?;
 
             let mut ast = AstFactory::new(tokens);
-            let statements = ast.parse_statements()?;
+            let mut type_handler = TypeHandler::new();
+            let statements = unwrap_print(ast.parse_statements(), &file_contents, &type_handler);
 
             let mut typer = Typer::new();
-            let mut type_handler = TypeHandler::new();
             let typed_ast = unwrap_print(
-                typer.resolve_stmts(statements, &mut type_handler),
+                typer.resolve_stmts(statements, &mut type_handler, &file_contents),
                 &file_contents,
-                &type_handler
+                &type_handler,
             );
             println!("{:#?}", typed_ast);
             println!("{:#?}", typer);
         }
+        Command::SSA => {
+            let tokens: Vec<Token> = lexer::scan(file_contents.clone())?;
+
+            let mut ast = AstFactory::new(tokens);
+            let mut type_handler = TypeHandler::new();
+            let statements = unwrap_print(ast.parse_statements(), &file_contents, &type_handler);
+
+            let mut typer = Typer::new();
+            let typed_ast = unwrap_print(
+                typer.resolve_stmts(statements, &mut type_handler, &file_contents),
+                &file_contents,
+                &type_handler,
+            );
+
+            let mut tables = typer.tables(type_handler);
+            let ssa = SSA::new(typed_ast, &mut tables);
+            println!("{:#?}", ssa);
+        }
         Command::Compile => {
-            todo!()
-            /*
-                let tokens: Vec<Token> = lexer::scan(file_contents)?;
+            let tokens: Vec<Token> = lexer::scan(file_contents.clone())?;
 
-                let mut ast = AstFactory::new(tokens);
-                let statements = ast.parse_statements()?;
-                let mut ir = IR::new(statements);
-                ir.optimize();
-                println!("{}", ir);
-                let mut compiler = Compiler::new(ir);
-                let content = compiler.compile();
-                let output_paths =
-                    OutputPaths::new(args.file_path, args.output_dir)?;
-                std::fs::write(&output_paths.asm_path, content)?;
-                output_paths.assemble()?;
-                output_paths.link()?;
-            }
-            Command::Run => {
-                let tokens: Vec<Token> = lexer::scan(file_contents)?;
+            let mut ast = AstFactory::new(tokens);
+            let mut type_handler = TypeHandler::new();
+            let statements = unwrap_print(ast.parse_statements(), &file_contents, &type_handler);
 
-                let mut ast = AstFactory::new(tokens);
-                let statements = ast.parse_statements()?;
-                let ir = IR::new(statements);
-                let mut compiler = Compiler::new(ir);
-                let content = compiler.compile();
-                let output_paths =
-                    OutputPaths::new(args.file_path, args.output_dir)?;
-                println!("{:#?}", output_paths);
-                std::fs::write(&output_paths.asm_path, content)?;
+            let mut typer = Typer::new();
+            let typed_ast = unwrap_print(
+                typer.resolve_stmts(statements, &mut type_handler, &file_contents),
+                &file_contents,
+                &type_handler,
+            );
 
-                output_paths.assemble()?;
-                println!("ASSEMBLED");
-                output_paths.link()?;
-                println!("LINKED");
-                output_paths.run()?;
-                println!("EXECUTED");
-                */
+            let mut tables = typer.tables(type_handler);
+            let ssa = SSA::new(typed_ast, &mut tables);
+            let mut writer = AsmWriter::new(tables);
+            writer.generate_funcs(ssa.functions);
+            println!("{}", writer.buffer);
+
+            let output_paths = OutputPaths::new(args.file_path, args.output_dir)?;
+            //println!("{:#?}", output_paths);
+            std::fs::write(&output_paths.asm_path, writer.buffer)?;
+        }
+        Command::Run => {
+            let tokens: Vec<Token> = lexer::scan(file_contents.clone())?;
+
+            let mut ast = AstFactory::new(tokens);
+            let mut type_handler = TypeHandler::new();
+            let statements = unwrap_print(ast.parse_statements(), &file_contents, &type_handler);
+
+            let mut typer = Typer::new();
+            let typed_ast = unwrap_print(
+                typer.resolve_stmts(statements, &mut type_handler, &file_contents),
+                &file_contents,
+                &type_handler,
+            );
+
+            let mut tables = typer.tables(type_handler);
+            let ssa = SSA::new(typed_ast, &mut tables);
+            let mut writer = AsmWriter::new(tables);
+            writer.generate_funcs(ssa.functions);
+
+            let output_paths = OutputPaths::new(args.file_path, args.output_dir)?;
+            //println!("{:#?}", output_paths);
+            output_paths.clean()?;
+            std::fs::write(&output_paths.asm_path, writer.buffer)?;
+            output_paths.assemble()?;
+            output_paths.run()?;
         }
         _ => todo!(),
     }
@@ -176,7 +211,7 @@ impl OutputPaths {
         } else {
             ""
         };
-        let asm_path = format!("{}/{}.asm", dir_string, file_stem);
+        let asm_path = format!("{}/{}.s", dir_string, file_stem);
         let obj_path = format!("{}/{}.o", dir_string, file_stem);
         let exe_path = format!("{}/{}", dir_string, file_stem);
 
@@ -187,15 +222,25 @@ impl OutputPaths {
             exe_path: PathBuf::from(exe_path),
         })
     }
+    fn clean(&self) -> anyhow::Result<()> {
+        let res = std::process::Command::new("rm")
+            .arg(&self.asm_path)
+            .arg(&self.obj_path)
+            .arg(&self.exe_path)
+            .output().unwrap();
+        Ok(())
+    }
     fn assemble(&self) -> anyhow::Result<()> {
-        let result = std::process::Command::new("nasm")
-            .arg("-felf64")
+        let result = std::process::Command::new("gcc")
+            .arg("-no-pie")
+            .arg("-g")
             .arg(&self.asm_path)
             .arg("-o")
-            .arg(&self.obj_path)
+            .arg(&self.exe_path)
             .output();
+        println!("{:?}", result);
         if let Err(e) = result {
-            return Err(anyhow!("NASM ERROR: {}", e));
+            return Err(anyhow!("GCC ERROR: {}", e));
         }
         Ok(())
     }
@@ -211,7 +256,7 @@ impl OutputPaths {
         Ok(())
     }
     fn run(&self) -> anyhow::Result<()> {
-        println!("EXE PATH: {:?}", self.exe_path);
+        //println!("EXE PATH: {:?}", self.exe_path);
         let result = std::process::Command::new(&self.exe_path).output()?;
         std::io::stdout().write_all(&result.stdout)?;
         std::io::stderr().write_all(&result.stderr)?;

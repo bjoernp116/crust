@@ -1,6 +1,11 @@
 use std::{collections::VecDeque, fmt::Display};
 
-use crate::lexer::{Position, Token, TokenType};
+use crate::{
+    error::{ResError, ResErrorKind, ResResult},
+    lexer::{Position, Token, TokenType},
+    ssa::{Operation, SlotID},
+    types::TypeID,
+};
 use anyhow::anyhow;
 
 #[derive(Clone)]
@@ -37,7 +42,6 @@ impl Node {
             Self::Assignment(_, _, pos) => pos.clone(),
         }
     }
-
 }
 
 #[derive(Clone)]
@@ -60,7 +64,7 @@ pub enum Statement {
         ret: Option<String>,
         body: Box<Statement>,
     },
-    Block(Vec<Statement>),
+    Block(Vec<Statement>, Option<Box<Statement>>),
     If(Node, Box<Statement>, Option<Box<Statement>>),
     While(Node, Box<Statement>),
     For(
@@ -77,13 +81,14 @@ impl Display for Statement {
             Statement::Exit(t) => write!(f, "exit: {}", t)?,
             Statement::Return(t) => write!(f, "return: {:?}", t)?,
             Statement::Expression(e) => write!(f, "expr: {}", e)?,
-            Statement::VarDecl(i, t, e) => {
-                write!(f, "decl: {} = {} (type = {:?})", i, e, t)?
-            }
-            Statement::Block(block) => {
+            Statement::VarDecl(i, t, e) => write!(f, "decl: {} = {} (type = {:?})", i, e, t)?,
+            Statement::Block(block, tail) => {
                 writeln!(f, "block: {{\n")?;
                 for stmnt in block {
                     writeln!(f, "\t{}", stmnt)?;
+                }
+                if let Some(s) = tail {
+                    writeln!(f, "\t{}", s)?;
                 }
                 writeln!(f, "}}\n")?;
             }
@@ -144,6 +149,16 @@ pub enum UnaryOperator {
     Neg,
 }
 
+impl UnaryOperator {
+    pub fn to_operation(&self, type_id: TypeID, dest: SlotID, x: SlotID) -> Operation {
+        use UnaryOperator::*;
+        match self {
+            Not => Operation::Not(type_id, dest, x),
+            Neg => Operation::Neg(type_id, dest, x),
+        }
+    }
+}
+
 impl Display for UnaryOperator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -177,28 +192,45 @@ impl BinaryOperator {
         use BinaryOperator::*;
         match self {
             Eq | NEq | G | GEq | L | LEq | Or | And => true,
-            _ => false
+            _ => false,
         }
     }
     pub fn is_numerical_out(&self) -> bool {
         use BinaryOperator::*;
         match self {
             Eq | NEq | G | GEq | L | LEq | Or | And => false,
-            _ => true 
+            _ => true,
         }
     }
     pub fn is_boolean_in(&self) -> bool {
         use BinaryOperator::*;
         match self {
             And | Or => true,
-            _ => false
+            _ => false,
         }
     }
     pub fn is_numerical_in(&self) -> bool {
         use BinaryOperator::*;
         match self {
             And | Or => false,
-            _ => true 
+            _ => true,
+        }
+    }
+
+    pub fn to_operation(&self, type_id: TypeID, dest: SlotID, x: SlotID, y: SlotID) -> Operation {
+        use BinaryOperator::*;
+        match self {
+            Add => Operation::Add(type_id, dest, x, y),
+            Sub => Operation::Sub(type_id, dest, x, y),
+            Mul => Operation::Mul(type_id, dest, x, y),
+            Div => Operation::Div(type_id, dest, x, y),
+            Eq => Operation::Eq(type_id, dest, x, y),
+            L => Operation::L(type_id, dest, x, y),
+            LEq => Operation::LEq(type_id, dest, x, y),
+            G => Operation::G(type_id, dest, x, y),
+            GEq => Operation::GEq(type_id, dest, x, y),
+            NEq => Operation::NEq(type_id, dest, x, y),
+            _ => todo!(),
         }
     }
 }
@@ -240,32 +272,23 @@ impl AstFactory {
     pub fn is(&self, token_type: TokenType) -> bool {
         self.tokens[self.current].token_type == token_type
     }
-    pub fn parse_statements(&mut self) -> anyhow::Result<Vec<Statement>> {
+    pub fn parse_statements(&mut self) -> ResResult<Vec<Statement>> {
         let mut out: Vec<Statement> = Vec::new();
         while self.current < self.tokens.len() {
-            let node = match self.parse_statement() {
-                Ok(expr) => expr,
-                Err(e) => {
-                    eprintln!("{}", e);
-                    std::process::exit(65);
-                }
-            };
+            let node = self.parse_statement()?;
             out.push(node);
         }
         Ok(out)
     }
-    pub fn parse_statement(&mut self) -> anyhow::Result<Statement> {
-        let out = match self.tokens[self.current].token_type {
+    pub fn parse_statement(&mut self) -> ResResult<Statement> {
+        let out: ResResult<Statement> = match self.tokens[self.current].token_type {
             TokenType::Return => {
                 self.current += 1;
-                if let TokenType::SemiColon =
-                    self.tokens[self.current].token_type
-                {
-                    Ok(Statement::Return(None))                    
+                if let TokenType::SemiColon = self.tokens[self.current].token_type {
+                    Ok(Statement::Return(None))
                 } else {
                     let value = self.parse_assignment()?;
                     Ok(Statement::Return(Some(value)))
-
                 }
             }
             TokenType::Exit => {
@@ -277,18 +300,16 @@ impl AstFactory {
                 self.current += 1;
                 let identifier = self.parse_number()?;
                 if let Node::Identifier(name, _) = identifier {
-                    let variable_type = if let TokenType::Colon =
-                        self.tokens[self.current].token_type
-                    {
-                        self.current += 2;
-                        Some(self.tokens[self.current - 1].raw.clone())
-                    } else {
-                        None
-                    };
+                    let variable_type =
+                        if let TokenType::Colon = self.tokens[self.current].token_type {
+                            self.current += 2;
+                            Some(self.tokens[self.current - 1].raw.clone())
+                        } else {
+                            None
+                        };
                     match self.tokens[self.current].token_type {
                         TokenType::SemiColon => {
-                            let pos =
-                                self.tokens[self.current].position.clone();
+                            let pos = self.tokens[self.current].position.clone();
                             let expr = Node::Litteral(Litteral::Nil, pos);
                             self.current += 1;
                             Ok(Statement::VarDecl(name, variable_type, expr))
@@ -299,18 +320,20 @@ impl AstFactory {
                             Ok(Statement::VarDecl(name, variable_type, expr))
                         }
                         _ => {
-                            eprintln!(
-                                "Expected = or ; after variable declearation!"
-                            );
+                            eprintln!("Expected = or ; after variable declearation!");
                             std::process::exit(70);
                         }
                     }
                 } else {
-                    Err(anyhow!("Expected identifier got {}", identifier))
+                    Err(ResError::new_err(
+                        ResErrorKind::ExpectedIdentifier,
+                        identifier.position(),
+                    ))
                 }
             }
             TokenType::LeftBrace => {
                 let mut statements: Vec<Statement> = Vec::new();
+                let mut tail = None;
                 self.current += 1;
                 while self.current < self.tokens.len() {
                     match self.tokens[self.current].token_type {
@@ -319,30 +342,25 @@ impl AstFactory {
                             break;
                         }
                         TokenType::SemiColon => self.current += 1,
-                        _ => statements.push(self.parse_statement()?),
+                        _ => {
+                            let stmt = self.parse_statement()?; 
+                            if let TokenType::RightBrace = self.tokens[self.current].token_type {
+                                tail = Some(Box::new(stmt))
+                            } else {
+                                statements.push(stmt);
+                                self.assert_semicolon()?;
+                            }
+                        },
                     }
                     if self.current == self.tokens.len() {
-                        eprintln!(
-                            "[line {}] Error at end: Expect '}}'.",
-                            self.tokens[self.current - 1].position.line()
-                        );
-                        std::process::exit(65);
+                        return Err(ResError::new_err(ResErrorKind::UnexpectedEOF, self.tokens.iter().last().unwrap().position))
                     }
                 }
-                Ok(Statement::Block(statements))
+                Ok(Statement::Block(statements, tail))
             }
             TokenType::If => {
                 self.current += 1;
-                match self.tokens[self.current].token_type {
-                    TokenType::LeftParen => {}
-                    _ => {
-                        eprintln!("Expected ( after if!");
-                        std::process::exit(65);
-                    }
-                }
-                self.current += 1;
                 let condition = self.parse_assignment()?;
-                self.current += 1;
                 let statement = Box::new(self.parse_statement()?);
                 let else_stmnt = if self.current < self.tokens.len() {
                     match self.tokens[self.current].token_type {
@@ -396,24 +414,14 @@ impl AstFactory {
                         let increment = self.parse_assignment()?;
                         self.current += 1;
                         let body = Box::new(self.parse_statement()?);
-                        return Ok(Statement::For(
-                            None,
-                            None,
-                            Some(increment),
-                            body,
-                        ));
+                        return Ok(Statement::For(None, None, Some(increment), body));
                     } else {
                         let condition = self.parse_assignment()?;
                         self.current += 1;
                         if self.is(TokenType::RightParen) {
                             self.current += 1;
                             let body = Box::new(self.parse_statement()?);
-                            return Ok(Statement::For(
-                                None,
-                                Some(condition),
-                                None,
-                                body,
-                            ));
+                            return Ok(Statement::For(None, Some(condition), None, body));
                         }
                     }
                 } else {
@@ -458,12 +466,13 @@ impl AstFactory {
                 self.current += 1;
                 let identifier_token = self.parse_var_identifier()?;
                 self.current += 1;
-                if let Node::Identifier(ident, _) = identifier_token {
+                if let Node::Identifier(ident, pos) = identifier_token {
                     match self.tokens[self.current].token_type {
                         TokenType::LeftParen => {}
                         _ => {
-                            return Err(anyhow!(
-                                "Expected initializer list after function defenition!"
+                            return Err(ResError::new_err(
+                                ResErrorKind::ExpectedInitializerList,
+                                pos,
                             ));
                         }
                     }
@@ -471,8 +480,7 @@ impl AstFactory {
                     let mut args = Vec::new();
                     loop {
                         let curr = self.tokens[self.current].token_type.clone();
-                        let next =
-                            self.tokens[self.current + 1].token_type.clone();
+                        let next = self.tokens[self.current + 1].token_type.clone();
                         match (curr, next) {
                             (_, TokenType::RightParen) => {
                                 self.current += 1;
@@ -487,13 +495,9 @@ impl AstFactory {
                     }
                     self.current += 1;
                     let mut ret = None;
-                    if let TokenType::Arrow =
-                        self.tokens[self.current].token_type
-                    {
+                    if let TokenType::Arrow = self.tokens[self.current].token_type {
                         self.current += 1;
-                        if let Node::Identifier(return_type, _) =
-                            self.parse_number()?
-                        {
+                        if let Node::Identifier(return_type, _) = self.parse_number()? {
                             ret = Some(return_type);
                         }
                     }
@@ -505,7 +509,10 @@ impl AstFactory {
                         body: Box::new(body),
                     })
                 } else {
-                    Err(anyhow!("Expected identifier in function defenition!"))
+                    Err(ResError::new_err(
+                        ResErrorKind::ExpectedIdentifier,
+                        identifier_token.position(),
+                    ))
                 }
             }
             _ => {
@@ -514,41 +521,33 @@ impl AstFactory {
             }
         };
 
-        match self.tokens.get(self.current) {
-            Some(Token {
-                position: _,
-                raw: _,
-                token_type: TokenType::SemiColon,
-            }) => {
-                self.current += 1;
-            }
-            _ => (),
-        }
 
         out
     }
-    fn parse_named_argument(&mut self) -> anyhow::Result<(String, String)> {
-        if let Node::Identifier(identifier, _) = self.parse_number()? {
+    fn parse_named_argument(&mut self) -> ResResult<(String, String)> {
+        let n = self.parse_number()?;
+        if let Node::Identifier(identifier, pos) = n {
             if let TokenType::Colon = self.tokens[self.current].token_type {
                 self.current += 1;
                 if let Node::Identifier(typename, _) = self.parse_number()? {
-                    if let TokenType::Comma =
-                        self.tokens[self.current].token_type
-                    {
+                    if let TokenType::Comma = self.tokens[self.current].token_type {
                         self.current += 1;
                     };
                     Ok((identifier, typename))
                 } else {
-                    Err(anyhow!("Expected typename after colon!"))
+                    Err(ResError::new_err(ResErrorKind::ExpectedTypeIdentifier, pos))
                 }
             } else {
-                Err(anyhow!("Expected colon after argument!"))
+                Err(ResError::new_err(ResErrorKind::ExpectedTypeIdentifier, pos))
             }
         } else {
-            Err(anyhow!("Expected identifier in initializer list!"))
+            Err(ResError::new_err(
+                ResErrorKind::ExpectedTypeIdentifier,
+                n.position(),
+            ))
         }
     }
-    fn parse_assignment(&mut self) -> anyhow::Result<Node> {
+    fn parse_assignment(&mut self) -> ResResult<Node> {
         let identifier: Node = self.parse_or()?;
         while self.current < self.tokens.len() {
             match self.tokens[self.current].token_type {
@@ -557,8 +556,7 @@ impl AstFactory {
                         self.current += 1;
                         let value = self.parse_assignment()?;
                         let position = Position::range(pos, value.position());
-                        let node =
-                            Node::Assignment(name, Box::new(value), position);
+                        let node = Node::Assignment(name, Box::new(value), position);
                         return Ok(node);
                     }
                 }
@@ -568,7 +566,7 @@ impl AstFactory {
         Ok(identifier)
     }
 
-    pub fn parse_or(&mut self) -> anyhow::Result<Node> {
+    pub fn parse_or(&mut self) -> ResResult<Node> {
         let mut node = self.parse_and()?;
         while self.current < self.tokens.len() {
             match self.tokens[self.current].token_type {
@@ -579,8 +577,7 @@ impl AstFactory {
                         break;
                     }
                     let right = Box::new(self.parse_and()?);
-                    let position =
-                        Position::range(node.position(), right.position());
+                    let position = Position::range(node.position(), right.position());
                     node = Node::Binary {
                         left: Box::new(node),
                         right,
@@ -594,7 +591,7 @@ impl AstFactory {
         Ok(node)
     }
 
-    pub fn parse_and(&mut self) -> anyhow::Result<Node> {
+    pub fn parse_and(&mut self) -> ResResult<Node> {
         let mut node = self.parse_equality()?;
         while self.current < self.tokens.len() {
             match self.tokens[self.current].token_type {
@@ -605,8 +602,7 @@ impl AstFactory {
                         break;
                     }
                     let right = Box::new(self.parse_equality()?);
-                    let position =
-                        Position::range(node.position(), right.position());
+                    let position = Position::range(node.position(), right.position());
                     node = Node::Binary {
                         left: Box::new(node),
                         right,
@@ -619,7 +615,7 @@ impl AstFactory {
         }
         Ok(node)
     }
-    pub fn parse_equality(&mut self) -> anyhow::Result<Node> {
+    pub fn parse_equality(&mut self) -> ResResult<Node> {
         let mut node: Node = self.parse_term()?;
         while self.current < self.tokens.len() {
             match self.tokens[self.current].token_type {
@@ -635,8 +631,7 @@ impl AstFactory {
                         break;
                     }
                     let right = Box::new(self.parse_term()?);
-                    let position =
-                        Position::range(node.position(), right.position());
+                    let position = Position::range(node.position(), right.position());
                     node = Node::Binary {
                         left: Box::new(node),
                         right,
@@ -650,7 +645,7 @@ impl AstFactory {
         Ok(node)
     }
 
-    fn parse_term(&mut self) -> anyhow::Result<Node> {
+    fn parse_term(&mut self) -> ResResult<Node> {
         let mut node: Node = self.parse_factor()?;
         while self.current < self.tokens.len() {
             match self.tokens[self.current].token_type {
@@ -661,8 +656,7 @@ impl AstFactory {
                         break;
                     }
                     let right = Box::new(self.parse_factor()?);
-                    let position =
-                        Position::range(node.position(), right.position());
+                    let position = Position::range(node.position(), right.position());
                     node = Node::Binary {
                         left: Box::new(node),
                         right,
@@ -676,7 +670,7 @@ impl AstFactory {
         Ok(node)
     }
 
-    fn parse_factor(&mut self) -> anyhow::Result<Node> {
+    fn parse_factor(&mut self) -> ResResult<Node> {
         let mut node: Node = self.parse_exponent()?;
         while self.current < self.tokens.len() {
             match self.tokens[self.current].token_type {
@@ -687,8 +681,7 @@ impl AstFactory {
                         break;
                     }
                     let right = Box::new(self.parse_exponent()?);
-                    let position =
-                        Position::range(node.position(), right.position());
+                    let position = Position::range(node.position(), right.position());
                     node = Node::Binary {
                         left: Box::new(node),
                         right,
@@ -702,7 +695,7 @@ impl AstFactory {
         Ok(node)
     }
 
-    fn parse_exponent(&mut self) -> anyhow::Result<Node> {
+    fn parse_exponent(&mut self) -> ResResult<Node> {
         let mut node: Node = self.parse_primary()?;
         while self.current < self.tokens.len() {
             match self.tokens[self.current].token_type {
@@ -713,8 +706,7 @@ impl AstFactory {
                         break;
                     }
                     let right = Box::new(self.parse_primary()?);
-                    let position =
-                        Position::range(node.position(), right.position());
+                    let position = Position::range(node.position(), right.position());
                     node = Node::Binary {
                         left: Box::new(node),
                         right,
@@ -728,9 +720,12 @@ impl AstFactory {
         Ok(node)
     }
 
-    fn parse_primary(&mut self) -> anyhow::Result<Node> {
+    fn parse_primary(&mut self) -> ResResult<Node> {
         if self.current >= self.tokens.len() {
-            return Err(anyhow!("Out of bounds access in parse_primary"));
+            return Err(ResError::new_err(
+                ResErrorKind::UnexpectedEOF,
+                self.tokens.iter().last().unwrap().position,
+            ));
         }
         match self.tokens[self.current].token_type.clone() {
             TokenType::LeftParen => self.parse_paren(),
@@ -739,7 +734,7 @@ impl AstFactory {
         }
     }
 
-    fn parse_unary(&mut self) -> anyhow::Result<Node> {
+    fn parse_unary(&mut self) -> ResResult<Node> {
         let op = self.tokens[self.current].clone();
         self.current += 1;
         let node: Node = self.parse_primary()?;
@@ -748,7 +743,7 @@ impl AstFactory {
         Ok(unary)
     }
 
-    fn parse_paren(&mut self) -> anyhow::Result<Node> {
+    fn parse_paren(&mut self) -> ResResult<Node> {
         let mut open_p = 0;
         let mut private_tokens: VecDeque<Token> = VecDeque::new();
 
@@ -770,7 +765,10 @@ impl AstFactory {
             self.current += 1;
         }
         if open_p != 0 {
-            return Err(anyhow!("Unescaped parenthesis"));
+            return Err(ResError::new_err(
+                ResErrorKind::UnescapedParenthesis,
+                self.tokens[self.current].position,
+            ));
         }
         let mut parser = AstFactory {
             tokens: private_tokens,
@@ -780,9 +778,12 @@ impl AstFactory {
         Ok(Node::Parenthesis(Box::new(node)))
     }
 
-    fn parse_number(&mut self) -> anyhow::Result<Node> {
+    fn parse_number(&mut self) -> ResResult<Node> {
         if self.current >= self.tokens.len() {
-            return Err(anyhow!("Out of bounds access in parse_number"));
+            return Err(ResError::new_err(
+                ResErrorKind::UnexpectedEOF,
+                self.tokens.iter().last().unwrap().position,
+            ));
         }
         let position = self.tokens[self.current].position.clone();
         match self.tokens[self.current].token_type.clone() {
@@ -809,34 +810,27 @@ impl AstFactory {
             }
             TokenType::Identifier(i) => {
                 self.current += 1;
-                if let TokenType::LeftParen =
-                    self.tokens[self.current].token_type
-                {
+                if let TokenType::LeftParen = self.tokens[self.current].token_type {
                     self.parse_func_identifier(i, position)
                 } else {
                     Ok(Node::Identifier(i.clone(), position))
                 }
             }
-            _ => Err(anyhow!(
-                "[line {}] Error at '{}': Expect expression.",
-                &self.tokens[self.current].position.line(),
-                &self.tokens[self.current].raw
+            _ => Err(ResError::new_err(
+                ResErrorKind::ExpectedExpression,
+                position,
             )),
         }
     }
 
-    fn parse_func_identifier(
-        &mut self,
-        i: String,
-        position: Position,
-    ) -> anyhow::Result<Node> {
+    fn parse_func_identifier(&mut self, i: String, position: Position) -> ResResult<Node> {
         self.current += 1;
         let mut args = Vec::new();
         loop {
             let prev = self.tokens[self.current - 1].token_type.clone();
             let curr = self.tokens[self.current].token_type.clone();
             match (prev, curr) {
-                (_, TokenType::RightParen) => {
+                (TokenType::Comma | TokenType::LeftParen, TokenType::RightParen) => {
                     self.current += 1;
                     break;
                 }
@@ -850,21 +844,35 @@ impl AstFactory {
         }
         Ok(Node::FuncIdentifier(i.clone(), args, position))
     }
-    fn parse_var_identifier(&mut self) -> anyhow::Result<Node> {
+    fn parse_var_identifier(&mut self) -> ResResult<Node> {
         let position = self.tokens[self.current].position.clone();
-        if let TokenType::Identifier(i) =
-            self.tokens[self.current].token_type.clone()
-        {
+        if let TokenType::Identifier(i) = self.tokens[self.current].token_type.clone() {
             Ok(Node::Identifier(i, position))
         } else {
-            Err(anyhow!("Expected expression"))
+            Err(ResError::new_err(
+                ResErrorKind::ExpectedExpression,
+                position,
+            ))
+        }
+    }
+
+    fn assert_semicolon(&mut self) -> ResResult<()> {
+        if let Some(token) = self.tokens.get(self.current) {
+            if let TokenType::SemiColon = token.token_type {
+                self.current += 1;
+                Ok(())
+            } else {
+                Err(ResError::new_err(ResErrorKind::ExpectedSemicolon, self.tokens[self.current - 1].position))
+            }
+        } else {
+            Ok(())
         }
     }
 }
 
 impl TryFrom<Token> for BinaryOperator {
-    type Error = anyhow::Error;
-    fn try_from(token: Token) -> anyhow::Result<BinaryOperator> {
+    type Error = ResError;
+    fn try_from(token: Token) -> ResResult<BinaryOperator> {
         match token.token_type {
             TokenType::Plus => Ok(BinaryOperator::Add),
             TokenType::Minus => Ok(BinaryOperator::Sub),
@@ -879,18 +887,24 @@ impl TryFrom<Token> for BinaryOperator {
             TokenType::Greater => Ok(BinaryOperator::G),
             TokenType::Or => Ok(BinaryOperator::Or),
             TokenType::And => Ok(BinaryOperator::And),
-            _ => Err(anyhow!("Cant convert Token {} to operator", token)),
+            tt => Err(ResError::new_err(
+                ResErrorKind::TokenToOperator(tt),
+                token.position,
+            )),
         }
     }
 }
 
 impl TryFrom<Token> for UnaryOperator {
-    type Error = anyhow::Error;
-    fn try_from(token: Token) -> anyhow::Result<UnaryOperator> {
+    type Error = ResError;
+    fn try_from(token: Token) -> ResResult<UnaryOperator> {
         match token.token_type {
             TokenType::Bang => Ok(UnaryOperator::Not),
             TokenType::Minus => Ok(UnaryOperator::Neg),
-            _ => Err(anyhow!("Cant convert Token {} to operator", token)),
+            tt => Err(ResError::new_err(
+                ResErrorKind::TokenToOperator(tt),
+                token.position,
+            )),
         }
     }
 }
