@@ -1,12 +1,11 @@
 mod asm;
-mod chunks;
-mod compiler;
+mod structs;
 mod error;
 mod functions;
+mod locations;
 mod lexer;
 mod parser;
 mod ssa;
-mod stack;
 mod symbols;
 mod types;
 use anyhow::anyhow;
@@ -37,7 +36,10 @@ struct CLI {
     #[arg(short, long, default_value_t = false)]
     debug: bool,
 
-    #[arg(short, long, alias = "o")]
+    #[arg(alias = "op", long, default_value_t = false)]
+    optimize: bool,
+
+    #[arg(short, long, alias = "od")]
     output_dir: Option<PathBuf>,
 }
 
@@ -61,7 +63,7 @@ enum Command {
 
 fn main() -> anyhow::Result<()> {
     let args = CLI::parse();
-
+    println!("{}", args.optimize);
     let file_contents: String = if let Ok(fc) = read_to_string(&args.file_path) {
         fc.to_owned()
     } else {
@@ -98,14 +100,18 @@ fn main() -> anyhow::Result<()> {
             let mut type_handler = TypeHandler::new();
             let statements = unwrap_print(ast.parse_statements(), &file_contents, &type_handler);
 
-            let mut typer = Typer::new();
-            let typed_ast = unwrap_print(
+            let mut typer = Typer::new(&mut type_handler);
+            let mut typed_ast = unwrap_print(
                 typer.resolve_stmts(statements, &mut type_handler, &file_contents),
                 &file_contents,
                 &type_handler,
             );
+            if args.optimize {
+                typer.optimize_stmts(&mut typed_ast);
+            }
             println!("{:#?}", typed_ast);
             println!("{:#?}", typer);
+            println!("{:#?}", type_handler);
         }
         Command::SSA => {
             let tokens: Vec<Token> = lexer::scan(file_contents.clone())?;
@@ -114,12 +120,15 @@ fn main() -> anyhow::Result<()> {
             let mut type_handler = TypeHandler::new();
             let statements = unwrap_print(ast.parse_statements(), &file_contents, &type_handler);
 
-            let mut typer = Typer::new();
-            let typed_ast = unwrap_print(
+            let mut typer = Typer::new(&mut type_handler);
+            let mut typed_ast = unwrap_print(
                 typer.resolve_stmts(statements, &mut type_handler, &file_contents),
                 &file_contents,
                 &type_handler,
             );
+            if args.optimize {
+                typer.optimize_stmts(&mut typed_ast);
+            }
 
             let mut tables = typer.tables(type_handler);
             let ssa = SSA::new(typed_ast, &mut tables);
@@ -132,22 +141,25 @@ fn main() -> anyhow::Result<()> {
             let mut type_handler = TypeHandler::new();
             let statements = unwrap_print(ast.parse_statements(), &file_contents, &type_handler);
 
-            let mut typer = Typer::new();
-            let typed_ast = unwrap_print(
+            let mut typer = Typer::new(&mut type_handler);
+            let mut typed_ast = unwrap_print(
                 typer.resolve_stmts(statements, &mut type_handler, &file_contents),
                 &file_contents,
                 &type_handler,
             );
+            if args.optimize {
+                typer.optimize_stmts(&mut typed_ast);
+            }
 
             let mut tables = typer.tables(type_handler);
-            let ssa = SSA::new(typed_ast, &mut tables);
+            let ssa = unwrap_print(SSA::new(typed_ast, &mut tables), &file_contents, &tables.type_handler);
             let mut writer = AsmWriter::new(tables);
-            writer.generate_funcs(ssa.functions);
-            println!("{}", writer.buffer);
+            //writer.generate_funcs(ssa.functions);
+            //println!("{}", writer.buffer());
 
             let output_paths = OutputPaths::new(args.file_path, args.output_dir)?;
             //println!("{:#?}", output_paths);
-            std::fs::write(&output_paths.asm_path, writer.buffer)?;
+            //std::fs::write(&output_paths.asm_path, writer.buffer())?;
         }
         Command::Run => {
             let tokens: Vec<Token> = lexer::scan(file_contents.clone())?;
@@ -156,22 +168,25 @@ fn main() -> anyhow::Result<()> {
             let mut type_handler = TypeHandler::new();
             let statements = unwrap_print(ast.parse_statements(), &file_contents, &type_handler);
 
-            let mut typer = Typer::new();
-            let typed_ast = unwrap_print(
+            let mut typer = Typer::new(&mut type_handler);
+            let mut typed_ast = unwrap_print(
                 typer.resolve_stmts(statements, &mut type_handler, &file_contents),
                 &file_contents,
                 &type_handler,
             );
+            if args.optimize {
+                typer.optimize_stmts(&mut typed_ast);
+            }
 
             let mut tables = typer.tables(type_handler);
-            let ssa = SSA::new(typed_ast, &mut tables);
+            let ssa = unwrap_print(SSA::new(typed_ast, &mut tables), &file_contents, &tables.type_handler);
             let mut writer = AsmWriter::new(tables);
-            writer.generate_funcs(ssa.functions);
+            //writer.generate_funcs(ssa.functions);
 
             let output_paths = OutputPaths::new(args.file_path, args.output_dir)?;
             //println!("{:#?}", output_paths);
             output_paths.clean()?;
-            std::fs::write(&output_paths.asm_path, writer.buffer)?;
+            //std::fs::write(&output_paths.asm_path, writer.buffer())?;
             output_paths.assemble()?;
             output_paths.run()?;
         }
@@ -235,10 +250,10 @@ impl OutputPaths {
             .arg("-no-pie")
             .arg("-g")
             .arg(&self.asm_path)
+            .arg("runtime.s")
             .arg("-o")
             .arg(&self.exe_path)
             .output();
-        println!("{:?}", result);
         if let Err(e) = result {
             return Err(anyhow!("GCC ERROR: {}", e));
         }
@@ -261,7 +276,7 @@ impl OutputPaths {
         std::io::stdout().write_all(&result.stdout)?;
         std::io::stderr().write_all(&result.stderr)?;
 
-        println!("{}", result.status);
+        println!("{:#?}", result);
 
         Ok(())
     }

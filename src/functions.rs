@@ -1,4 +1,7 @@
-use crate::types::TypeID;
+use crate::{
+    parser::TypeSyntax,
+    types::{TypeHandler, TypeID},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FuncID(pub usize);
@@ -10,7 +13,6 @@ pub struct FuncSignature {
     pub ret: TypeID,
 }
 
-
 #[derive(Debug)]
 pub struct FuncTable {
     functions: Vec<FuncSignature>,
@@ -18,14 +20,29 @@ pub struct FuncTable {
 }
 
 impl FuncTable {
-    pub fn new() -> Self {
-        Self { functions: Vec::new(), current: None }
+    pub fn new(th: &mut TypeHandler) -> Self {
+        let mut functions = Vec::new();
+        let ref_u8 = th.lookup_or_define(TypeSyntax::Reference {
+            mutable: false,
+            pointee: Box::new(TypeSyntax::Raw("u8".to_owned())),
+        }).unwrap();
+        functions.push(FuncSignature {
+            identifier: "crust_write".to_owned(),
+            params: vec![ref_u8, TypeID::U64],
+            ret: TypeID::I64,
+        });
+        functions.push(FuncSignature {
+            identifier: "crust_exit".to_owned(),
+            params: vec![TypeID::U64],
+            ret: TypeID::NEVER,
+        });
+        Self {
+            functions,
+            current: None,
+        }
     }
 
-    pub fn insert(
-        &mut self,
-        signature: FuncSignature,
-    ) -> FuncID {
+    pub fn insert(&mut self, signature: FuncSignature) -> FuncID {
         let id = FuncID(self.functions.len());
         self.functions.push(signature);
         id
@@ -34,7 +51,7 @@ impl FuncTable {
     pub fn get(&self, id: &FuncID) -> &FuncSignature {
         &self.functions[id.0]
     }
-    
+
     pub fn current(&self) -> Option<&FuncSignature> {
         if let Some(id) = self.current {
             Some(self.get(&id))

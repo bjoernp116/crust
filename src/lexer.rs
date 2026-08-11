@@ -78,7 +78,12 @@ pub enum TokenType {
     True,
     Let,
     While,
-    Exit,
+    Loop,
+    Break,
+    Struct,
+
+    Mut,
+    Reference,
 
     EqualEqual,
     BangEqual,
@@ -283,6 +288,7 @@ impl Display for Token {
             Dot => "DOT",
             Comma => "COMMA",
             Plus => "PLUS",
+            Mut => "MUT",
             Minus => "MINUS",
             Slash => "SLASH",
             SemiColon => "SEMICOLON",
@@ -296,6 +302,7 @@ impl Display for Token {
             Arrow => "ARROW",
 
             If => "IF",
+            Reference => "REFERENCE",
             And => "AND",
             Class => "CLASS",
             Else => "ELSE",
@@ -304,12 +311,14 @@ impl Display for Token {
             Fun => "FUN",
             Nil => "NIL",
             Or => "OR",
-            Exit => "EXIT",
             Return => "RETURN",
             This => "THIS",
             True => "TRUE",
             Let => "LET",
             While => "WHILE",
+            Loop => "LOOP",
+            Break => "BREAK",
+            Struct => "STRUCT",
 
             EqualEqual => "EQUAL_EQUAL",
             BangEqual => "BANG_EQUAL",
@@ -346,6 +355,7 @@ impl From<char> for TokenType {
             '>' => Greater,
             '<' => Less,
             '^' => Carrot,
+            '&' => Reference,
             c => Invalid(format!("Unexpected character: {}", c)),
         }
     }
@@ -364,12 +374,15 @@ impl From<String> for TokenType {
             "fun" => Fun,
             "nil" => Nil,
             "or" => Or,
-            "exit" => Exit,
             "return" => Return,
             "this" => This,
             "true" => True,
             "let" => Let,
             "while" => While,
+            "loop" => Loop,
+            "break" => Break,
+            "struct" => Struct,
+            "mut" => Mut,
             _ => Identifier(value),
         }
     }

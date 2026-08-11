@@ -1,9 +1,17 @@
-fun main() -> u16 {
-    let x: u16 = 4;
-    let y: u16 = 3;
-    x + y
+
+fun main() -> u64 {
+    let a = 43;
+
+    let b = 23;
+
+    if (a <= b) {
+        add(a, &b)
+    } else {
+        exit(3);
+        0
+    }
 }
 
-fun add() -> u16 {
-    return 0;
+fun add(a: u64, b: &u64) -> u64 {
+    return a + *b;
 }

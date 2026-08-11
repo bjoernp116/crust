@@ -1,12 +1,8 @@
 use std::{collections::VecDeque, fmt::Display};
 
 use crate::{
-    error::{ResError, ResErrorKind, ResResult},
-    lexer::{Position, Token, TokenType},
-    ssa::{Operation, SlotID},
-    types::TypeID,
+    error::{ResError, ResErrorKind, ResResult}, lexer::{Position, Token, TokenType}, locations::ValueLocation, ssa::{Operation, SlotID, ValueID}, types::TypeID
 };
-use anyhow::anyhow;
 
 #[derive(Clone)]
 pub enum Node {
@@ -20,8 +16,15 @@ pub enum Node {
     Unary(UnaryOperator, Box<Node>, Position),
     Litteral(Litteral, Position),
     Identifier(String, Position),
+    FieldAccess(Box<Node>, String, Position),
     FuncIdentifier(String, Vec<Node>, Position),
-    Assignment(String, Box<Node>, Position),
+    Assignment(Box<Node>, Box<Node>, Position),
+    If(Box<Node>, Block, Option<Block>, Position),
+    Block(Block),
+    Loop(Block),
+    Constructor(String, Vec<(String, Node)>, Position),
+    Address(bool, Box<Node>, Position),
+    Deref(Box<Node>, Position),
 }
 
 impl Node {
@@ -40,64 +43,81 @@ impl Node {
             Self::Identifier(_, pos) => pos.clone(),
             Self::FuncIdentifier(_, _, pos) => pos.clone(),
             Self::Assignment(_, _, pos) => pos.clone(),
+            Self::If(_, _, _, pos) => pos.clone(),
+            Self::Block(block) => block.position.clone(),
+            Self::Loop(block) => block.position.clone(),
+            Self::Constructor(_, _, pos) => pos.clone(),
+            Self::FieldAccess(_, _, pos) => pos.clone(),
+            Self::Address(_, _, pos) => pos.clone(),
+            Self::Deref(_, pos) => pos.clone(),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Block {
+    pub stmts: Vec<Statement>,
+    pub tail: Option<Box<Node>>,
+    pub position: Position,
+}
+
+impl Block {
+    pub fn collect(&self) -> Vec<Statement> {
+        let mut v = self.stmts.clone();
+        if let Some(tail) = &self.tail {
+            v.push(Statement::Expression(*tail.clone()));
+        }
+        v
     }
 }
 
 #[derive(Clone)]
 pub enum Litteral {
-    Number(f64),
+    Number(usize),
     Boolean(bool),
     Nil,
     String(String),
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub enum TypeSyntax {
+    Raw(String),
+    Reference {
+        mutable: bool,
+        pointee: Box<TypeSyntax>,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub enum Statement {
     Expression(Node),
-    Exit(Node),
     Return(Option<Node>),
-    VarDecl(String, Option<String>, Node),
+    Break(Option<Node>),
+    VarDecl(String, Option<TypeSyntax>, bool, Node),
     FuncDecl {
         identifier: String,
-        args: Vec<(String, String)>,
+        args: Vec<(String, TypeSyntax)>,
         ret: Option<String>,
-        body: Box<Statement>,
+        body: Block,
     },
-    Block(Vec<Statement>, Option<Box<Statement>>),
-    If(Node, Box<Statement>, Option<Box<Statement>>),
-    While(Node, Box<Statement>),
+    While(Node, Block),
     For(
         Option<Box<Statement>>,
         Option<Node>,
         Option<Node>,
         Box<Statement>,
     ),
+    Struct(String, Vec<(String, TypeSyntax)>),
 }
 
 impl Display for Statement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Statement::Exit(t) => write!(f, "exit: {}", t)?,
             Statement::Return(t) => write!(f, "return: {:?}", t)?,
+            Statement::Break(t) => write!(f, "break: {:?}", t)?,
             Statement::Expression(e) => write!(f, "expr: {}", e)?,
-            Statement::VarDecl(i, t, e) => write!(f, "decl: {} = {} (type = {:?})", i, e, t)?,
-            Statement::Block(block, tail) => {
-                writeln!(f, "block: {{\n")?;
-                for stmnt in block {
-                    writeln!(f, "\t{}", stmnt)?;
-                }
-                if let Some(s) = tail {
-                    writeln!(f, "\t{}", s)?;
-                }
-                writeln!(f, "}}\n")?;
-            }
-            Statement::If(condition, then, els) => {
-                writeln!(f, "if {}", condition)?;
-                writeln!(f, "then {}", then)?;
-                if let Some(el) = els {
-                    writeln!(f, "else {}", el)?;
-                }
+            Statement::VarDecl(i, t, m, e) => {
+                write!(f, "{} decl: {} = {} (type = {:?})", m, i, e, t)?
             }
             Statement::While(condition, body) => {
                 writeln!(f, "while {}", condition)?;
@@ -116,6 +136,9 @@ impl Display for Statement {
                 writeln!(f, "func {} ({:?}) -> {:?}", identifier, args, ret)?;
                 writeln!(f, "do {}", body)?;
             }
+            Statement::Struct(ident, fields) => {
+                writeln!(f, "struct {} {{{:#?}}}", ident, fields)?;
+            }
         }
         Ok(())
     }
@@ -125,7 +148,8 @@ impl Display for Litteral {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Litteral::Number(n) => write!(f, "{}", n),
-            Litteral::Boolean(b) => write!(f, "{}", b),
+            Litteral::Boolean(true) => write!(f, "1"),
+            Litteral::Boolean(false) => write!(f, "0"),
             Litteral::Nil => write!(f, "nil"),
             Litteral::String(s) => write!(f, "{}", s),
         }
@@ -150,7 +174,7 @@ pub enum UnaryOperator {
 }
 
 impl UnaryOperator {
-    pub fn to_operation(&self, type_id: TypeID, dest: SlotID, x: SlotID) -> Operation {
+    pub fn to_operation(&self, type_id: TypeID, dest: ValueID, x: ValueID) -> Operation {
         use UnaryOperator::*;
         match self {
             Not => Operation::Not(type_id, dest, x),
@@ -216,8 +240,7 @@ impl BinaryOperator {
             _ => true,
         }
     }
-
-    pub fn to_operation(&self, type_id: TypeID, dest: SlotID, x: SlotID, y: SlotID) -> Operation {
+    pub fn to_operation(&self, type_id: TypeID, dest: ValueID, x: ValueID, y: ValueID) -> Operation {
         use BinaryOperator::*;
         match self {
             Add => Operation::Add(type_id, dest, x, y),
@@ -231,6 +254,28 @@ impl BinaryOperator {
             GEq => Operation::GEq(type_id, dest, x, y),
             NEq => Operation::NEq(type_id, dest, x, y),
             _ => todo!(),
+        }
+    }
+
+    pub fn interpret(&self, left: Litteral, right: Litteral) -> Option<Litteral> {
+        match (left, right) {
+            (Litteral::Number(l), Litteral::Number(r)) => {
+                let litt = match self {
+                    Self::Eq => Litteral::Boolean(l == r),
+                    Self::NEq => Litteral::Boolean(l != r),
+                    Self::G => Litteral::Boolean(l > r),
+                    Self::GEq => Litteral::Boolean(l >= r),
+                    Self::L => Litteral::Boolean(l < r),
+                    Self::LEq => Litteral::Boolean(l <= r),
+                    Self::Add => Litteral::Number(l + r),
+                    Self::Sub => Litteral::Number(l - r),
+                    Self::Mul => Litteral::Number(l * r),
+                    Self::Div => Litteral::Number(l / r),
+                    _ => todo!(),
+                };
+                Some(litt)
+            }
+            _ => None,
         }
     }
 }
@@ -281,6 +326,7 @@ impl AstFactory {
         Ok(out)
     }
     pub fn parse_statement(&mut self) -> ResResult<Statement> {
+        self.debug("parse_statement");
         let out: ResResult<Statement> = match self.tokens[self.current].token_type {
             TokenType::Return => {
                 self.current += 1;
@@ -291,33 +337,54 @@ impl AstFactory {
                     Ok(Statement::Return(Some(value)))
                 }
             }
-            TokenType::Exit => {
+            TokenType::Break => {
                 self.current += 1;
-                let value = self.parse_assignment()?;
-                Ok(Statement::Exit(value))
+                if let TokenType::SemiColon = self.tokens[self.current].token_type {
+                    Ok(Statement::Break(None))
+                } else {
+                    let value = self.parse_assignment()?;
+                    Ok(Statement::Break(Some(value)))
+                }
             }
             TokenType::Let => {
                 self.current += 1;
+                let mutable = if let TokenType::Mut = self.tokens[self.current].token_type {
+                    self.current += 1;
+                    true
+                } else {
+                    false
+                };
                 let identifier = self.parse_number()?;
                 if let Node::Identifier(name, _) = identifier {
                     let variable_type =
                         if let TokenType::Colon = self.tokens[self.current].token_type {
-                            self.current += 2;
-                            Some(self.tokens[self.current - 1].raw.clone())
+                            self.current += 1;
+                            if let TokenType::Reference = self.tokens[self.current].token_type {
+                                self.current += 1;
+                                let base = self.tokens[self.current].raw.clone();
+                                Some(TypeSyntax::Reference {
+                                    mutable: false,
+                                    pointee: Box::new(TypeSyntax::Raw(base)),
+                                })
+                            } else {
+                                Some(TypeSyntax::Raw(self.tokens[self.current].raw.clone()))
+                            }
                         } else {
+                            self.current -= 1;
                             None
                         };
+                    self.current += 1;
                     match self.tokens[self.current].token_type {
                         TokenType::SemiColon => {
                             let pos = self.tokens[self.current].position.clone();
                             let expr = Node::Litteral(Litteral::Nil, pos);
                             self.current += 1;
-                            Ok(Statement::VarDecl(name, variable_type, expr))
+                            Ok(Statement::VarDecl(name, variable_type, mutable, expr))
                         }
                         TokenType::Equal => {
                             self.current += 1;
                             let expr = self.parse_assignment()?;
-                            Ok(Statement::VarDecl(name, variable_type, expr))
+                            Ok(Statement::VarDecl(name, variable_type, mutable, expr))
                         }
                         _ => {
                             eprintln!("Expected = or ; after variable declearation!");
@@ -331,51 +398,6 @@ impl AstFactory {
                     ))
                 }
             }
-            TokenType::LeftBrace => {
-                let mut statements: Vec<Statement> = Vec::new();
-                let mut tail = None;
-                self.current += 1;
-                while self.current < self.tokens.len() {
-                    match self.tokens[self.current].token_type {
-                        TokenType::RightBrace => {
-                            self.current += 1;
-                            break;
-                        }
-                        TokenType::SemiColon => self.current += 1,
-                        _ => {
-                            let stmt = self.parse_statement()?; 
-                            if let TokenType::RightBrace = self.tokens[self.current].token_type {
-                                tail = Some(Box::new(stmt))
-                            } else {
-                                statements.push(stmt);
-                                self.assert_semicolon()?;
-                            }
-                        },
-                    }
-                    if self.current == self.tokens.len() {
-                        return Err(ResError::new_err(ResErrorKind::UnexpectedEOF, self.tokens.iter().last().unwrap().position))
-                    }
-                }
-                Ok(Statement::Block(statements, tail))
-            }
-            TokenType::If => {
-                self.current += 1;
-                let condition = self.parse_assignment()?;
-                let statement = Box::new(self.parse_statement()?);
-                let else_stmnt = if self.current < self.tokens.len() {
-                    match self.tokens[self.current].token_type {
-                        TokenType::Else => {
-                            self.current += 1;
-                            Some(Box::new(self.parse_statement()?))
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-
-                Ok(Statement::If(condition, statement, else_stmnt))
-            }
             TokenType::While => {
                 self.current += 1;
                 match self.tokens[self.current].token_type {
@@ -388,9 +410,9 @@ impl AstFactory {
                 self.current += 1;
                 let condition = self.parse_assignment()?;
                 self.current += 1;
-                let statement = Box::new(self.parse_statement()?);
+                let block = self.parse_block()?;
 
-                Ok(Statement::While(condition, statement))
+                Ok(Statement::While(condition, block))
             }
             TokenType::For => {
                 self.current += 1;
@@ -497,17 +519,58 @@ impl AstFactory {
                     let mut ret = None;
                     if let TokenType::Arrow = self.tokens[self.current].token_type {
                         self.current += 1;
-                        if let Node::Identifier(return_type, _) = self.parse_number()? {
+                        if let Node::Identifier(return_type, _) = self.parse_var_identifier()? {
                             ret = Some(return_type);
                         }
+                        self.current += 1;
                     }
-                    let body = self.parse_statement()?;
+                    let body = self.parse_block()?;
                     Ok(Statement::FuncDecl {
                         identifier: ident,
                         args,
                         ret,
-                        body: Box::new(body),
+                        body,
                     })
+                } else {
+                    Err(ResError::new_err(
+                        ResErrorKind::ExpectedIdentifier,
+                        identifier_token.position(),
+                    ))
+                }
+            }
+            TokenType::Struct => {
+                self.current += 1;
+                let identifier_token = self.parse_var_identifier()?;
+                self.current += 1;
+                if let Node::Identifier(ident, pos) = identifier_token {
+                    match self.tokens[self.current].token_type {
+                        TokenType::LeftBrace => {}
+                        _ => {
+                            return Err(ResError::new_err(
+                                ResErrorKind::ExpectedInitializerList,
+                                pos,
+                            ));
+                        }
+                    }
+                    self.current += 1;
+                    let mut args = Vec::new();
+                    loop {
+                        let curr = self.tokens[self.current].token_type.clone();
+                        let next = self.tokens[self.current + 1].token_type.clone();
+                        match (curr, next) {
+                            (_, TokenType::RightBrace) => {
+                                self.current += 1;
+                                break;
+                            }
+                            (TokenType::RightBrace, _) => break,
+                            _ => {
+                                let arg = self.parse_named_argument()?;
+                                args.push(arg);
+                            }
+                        }
+                    }
+                    self.current += 1;
+                    Ok(Statement::Struct(ident, args))
                 } else {
                     Err(ResError::new_err(
                         ResErrorKind::ExpectedIdentifier,
@@ -521,22 +584,20 @@ impl AstFactory {
             }
         };
 
-
         out
     }
-    fn parse_named_argument(&mut self) -> ResResult<(String, String)> {
+    fn parse_named_argument(&mut self) -> ResResult<(String, TypeSyntax)> {
+        self.debug("parse_named_argument");
         let n = self.parse_number()?;
         if let Node::Identifier(identifier, pos) = n {
             if let TokenType::Colon = self.tokens[self.current].token_type {
                 self.current += 1;
-                if let Node::Identifier(typename, _) = self.parse_number()? {
-                    if let TokenType::Comma = self.tokens[self.current].token_type {
-                        self.current += 1;
-                    };
-                    Ok((identifier, typename))
-                } else {
-                    Err(ResError::new_err(ResErrorKind::ExpectedTypeIdentifier, pos))
+                println!("{}", self.tokens[self.current]);
+                let typename = self.parse_type_syntax()?;
+                if let TokenType::Comma = self.tokens[self.current].token_type {
+                    self.current += 1;
                 }
+                Ok((identifier, typename))
             } else {
                 Err(ResError::new_err(ResErrorKind::ExpectedTypeIdentifier, pos))
             }
@@ -548,16 +609,30 @@ impl AstFactory {
         }
     }
     fn parse_assignment(&mut self) -> ResResult<Node> {
+        self.debug("parse_assignment");
         let identifier: Node = self.parse_or()?;
         while self.current < self.tokens.len() {
             match self.tokens[self.current].token_type {
                 TokenType::Equal => {
-                    if let Node::Identifier(name, pos) = identifier {
+                    if let Node::Identifier(_, pos) = identifier.clone() {
                         self.current += 1;
                         let value = self.parse_assignment()?;
                         let position = Position::range(pos, value.position());
-                        let node = Node::Assignment(name, Box::new(value), position);
+                        let node =
+                            Node::Assignment(Box::new(identifier), Box::new(value), position);
                         return Ok(node);
+                    } else if let Node::FieldAccess(_, _, pos) = identifier.clone() {
+                        self.current += 1;
+                        let value = self.parse_assignment()?;
+                        let position = Position::range(pos, value.position());
+                        let node =
+                            Node::Assignment(Box::new(identifier), Box::new(value), position);
+                        return Ok(node);
+                    } else {
+                        return Err(ResError::new_err(
+                            ResErrorKind::ExpectedIdentifier,
+                            self.tokens[self.current].position,
+                        ));
                     }
                 }
                 _ => break,
@@ -565,8 +640,8 @@ impl AstFactory {
         }
         Ok(identifier)
     }
-
     pub fn parse_or(&mut self) -> ResResult<Node> {
+        self.debug("parse_or");
         let mut node = self.parse_and()?;
         while self.current < self.tokens.len() {
             match self.tokens[self.current].token_type {
@@ -591,7 +666,31 @@ impl AstFactory {
         Ok(node)
     }
 
+    pub fn parse_type_syntax(&mut self) -> ResResult<TypeSyntax> {
+        self.debug("parse_type_syntax");
+        if let TokenType::Reference = self.tokens[self.current].token_type {
+            self.current += 1;
+            if let TokenType::Identifier(base) = &self.tokens[self.current].token_type {
+                self.current += 1;
+                Ok(TypeSyntax::Reference {
+                    mutable: false,
+                    pointee: Box::new(TypeSyntax::Raw(base.clone())),
+                })
+            } else {
+                Err(ResError::new_err(ResErrorKind::ExpectedIdentifier, self.tokens[self.current].position))
+            }
+        } else {
+            if let TokenType::Identifier(base) = &self.tokens[self.current].token_type {
+                self.current += 1;
+                Ok(TypeSyntax::Raw(base.clone()))
+            } else {
+                Err(ResError::new_err(ResErrorKind::ExpectedIdentifier, self.tokens[self.current].position))
+            }
+        }
+    }
+
     pub fn parse_and(&mut self) -> ResResult<Node> {
+        self.debug("parse_and");
         let mut node = self.parse_equality()?;
         while self.current < self.tokens.len() {
             match self.tokens[self.current].token_type {
@@ -616,6 +715,7 @@ impl AstFactory {
         Ok(node)
     }
     pub fn parse_equality(&mut self) -> ResResult<Node> {
+        self.debug("parse_equality");
         let mut node: Node = self.parse_term()?;
         while self.current < self.tokens.len() {
             match self.tokens[self.current].token_type {
@@ -646,6 +746,7 @@ impl AstFactory {
     }
 
     fn parse_term(&mut self) -> ResResult<Node> {
+        self.debug("parse_term");
         let mut node: Node = self.parse_factor()?;
         while self.current < self.tokens.len() {
             match self.tokens[self.current].token_type {
@@ -671,6 +772,7 @@ impl AstFactory {
     }
 
     fn parse_factor(&mut self) -> ResResult<Node> {
+        self.debug("parse_factor");
         let mut node: Node = self.parse_exponent()?;
         while self.current < self.tokens.len() {
             match self.tokens[self.current].token_type {
@@ -696,7 +798,8 @@ impl AstFactory {
     }
 
     fn parse_exponent(&mut self) -> ResResult<Node> {
-        let mut node: Node = self.parse_primary()?;
+        self.debug("parse_exponent");
+        let mut node: Node = self.parse_field_access()?;
         while self.current < self.tokens.len() {
             match self.tokens[self.current].token_type {
                 TokenType::Carrot => {
@@ -721,6 +824,7 @@ impl AstFactory {
     }
 
     fn parse_primary(&mut self) -> ResResult<Node> {
+        self.debug("parse_primary");
         if self.current >= self.tokens.len() {
             return Err(ResError::new_err(
                 ResErrorKind::UnexpectedEOF,
@@ -730,20 +834,144 @@ impl AstFactory {
         match self.tokens[self.current].token_type.clone() {
             TokenType::LeftParen => self.parse_paren(),
             TokenType::Bang | TokenType::Minus => self.parse_unary(),
+            TokenType::Reference | TokenType::Star => self.parse_address(),
+            TokenType::LeftBrace => Ok(Node::Block(self.parse_block()?)),
+            TokenType::If => {
+                let pos1 = self.tokens[self.current].position.clone();
+                self.current += 1;
+                let condition = self.parse_assignment()?;
+                let statement = self.parse_block()?;
+                let else_stmnt = if self.current < self.tokens.len() {
+                    match self.tokens[self.current].token_type {
+                        TokenType::Else => {
+                            self.current += 1;
+                            Some(self.parse_block()?)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let pos2 = self.tokens[self.current].position.clone();
+
+                Ok(Node::If(
+                    Box::new(condition),
+                    statement,
+                    else_stmnt,
+                    Position::range(pos1, pos2),
+                ))
+            }
+            TokenType::Loop => {
+                self.current += 1;
+                let block = self.parse_block()?;
+                Ok(Node::Loop(block))
+            }
+
             _ => self.parse_number(),
         }
     }
 
+    fn parse_block(&mut self) -> ResResult<Block> {
+        self.debug("parse_block");
+        let pos1 = self.tokens[self.current].position.clone();
+        let mut statements: Vec<Statement> = Vec::new();
+        let mut tail = None;
+        self.current += 1;
+        while self.current < self.tokens.len() {
+            match self.tokens[self.current].token_type {
+                TokenType::RightBrace => {
+                    break;
+                }
+                TokenType::SemiColon => self.current += 1,
+                _ => {
+                    let stmt = self.parse_statement()?;
+                    if let TokenType::RightBrace = self.tokens[self.current].token_type {
+                        match stmt {
+                            Statement::Expression(node) => tail = Some(Box::new(node)),
+                            s => {
+                                statements.push(s);
+                                self.assert_semicolon()?;
+                            }
+                        }
+                    } else {
+                        statements.push(stmt.clone());
+                        self.assert_semicolon()?;
+                    }
+                }
+            }
+        }
+        if self.current >= self.tokens.len() {
+            return Err(ResError::new_err(
+                ResErrorKind::UnexpectedEOF,
+                self.tokens.iter().last().unwrap().position,
+            ));
+        }
+        let pos2 = self.tokens[self.current - 1].position.clone();
+        self.current += 1;
+        let block = Block {
+            stmts: statements,
+            tail: tail,
+            position: Position::range(pos1, pos2),
+        };
+        let out = Ok(block);
+        out
+    }
+
     fn parse_unary(&mut self) -> ResResult<Node> {
+        self.debug("parse_unary");
         let op = self.tokens[self.current].clone();
         self.current += 1;
-        let node: Node = self.parse_primary()?;
+        let node: Node = self.parse_field_access()?;
         let position = Position::range(op.clone().position, node.position());
         let unary = Node::Unary(op.try_into()?, Box::new(node), position);
         Ok(unary)
     }
 
+    fn parse_address(&mut self) -> ResResult<Node> {
+        self.debug("parse_address");
+        let op = self.tokens[self.current].clone();
+        self.current += 1;
+        let node: Node = self.parse_field_access()?;
+        let position = Position::range(op.position, node.position());
+        match op.token_type {
+            TokenType::Reference => {
+                Ok(Node::Address(false, Box::new(node), position))
+            },
+            TokenType::Star => {
+                Ok(Node::Deref(Box::new(node), position))
+            },
+            _ => unreachable!()
+        }
+    }
+
+    fn parse_field_access(&mut self) -> ResResult<Node> {
+        self.debug("parse_field_access");
+        let mut node = self.parse_primary()?;
+        while self.current < self.tokens.len() {
+            match self.tokens[self.current].token_type {
+                TokenType::Dot => {
+                    self.current += 1;
+                    let (field_name, field_pos) =
+                        if let Node::Identifier(i, pos) = self.parse_number()? {
+                            (i, pos)
+                        } else {
+                            return Err(ResError::new_err(
+                                ResErrorKind::ExpectedIdentifier,
+                                node.position(),
+                            ));
+                        };
+
+                    let position = Position::range(node.position(), field_pos);
+                    node = Node::FieldAccess(Box::new(node), field_name, position);
+                }
+                _ => break,
+            }
+        }
+        Ok(node)
+    }
+
     fn parse_paren(&mut self) -> ResResult<Node> {
+        self.debug("parse_paren");
         let mut open_p = 0;
         let mut private_tokens: VecDeque<Token> = VecDeque::new();
 
@@ -779,6 +1007,7 @@ impl AstFactory {
     }
 
     fn parse_number(&mut self) -> ResResult<Node> {
+        self.debug("parse_number");
         if self.current >= self.tokens.len() {
             return Err(ResError::new_err(
                 ResErrorKind::UnexpectedEOF,
@@ -790,7 +1019,7 @@ impl AstFactory {
             TokenType::Number(x) => {
                 let number = x;
                 self.current += 1;
-                Ok(Node::Litteral(Litteral::Number(number as f64), position))
+                Ok(Node::Litteral(Litteral::Number(number as usize), position))
             }
             TokenType::True => {
                 self.current += 1;
@@ -810,10 +1039,10 @@ impl AstFactory {
             }
             TokenType::Identifier(i) => {
                 self.current += 1;
-                if let TokenType::LeftParen = self.tokens[self.current].token_type {
-                    self.parse_func_identifier(i, position)
-                } else {
-                    Ok(Node::Identifier(i.clone(), position))
+                match self.tokens[self.current].token_type {
+                    TokenType::LeftBrace => self.parse_constructor(i, position),
+                    TokenType::LeftParen => self.parse_func_identifier(i, position),
+                    _ => Ok(Node::Identifier(i.clone(), position)),
                 }
             }
             _ => Err(ResError::new_err(
@@ -824,6 +1053,7 @@ impl AstFactory {
     }
 
     fn parse_func_identifier(&mut self, i: String, position: Position) -> ResResult<Node> {
+        self.debug("parse_func_identifier");
         self.current += 1;
         let mut args = Vec::new();
         loop {
@@ -844,7 +1074,51 @@ impl AstFactory {
         }
         Ok(Node::FuncIdentifier(i.clone(), args, position))
     }
+    fn parse_constructor(&mut self, i: String, position: Position) -> ResResult<Node> {
+        self.debug("parse_constructor");
+        self.current += 1;
+        let mut idents = Vec::new();
+        let mut nodes = Vec::new();
+        loop {
+            let prev = self.tokens[self.current - 1].token_type.clone();
+            let curr = self.tokens[self.current].token_type.clone();
+            match (prev, curr) {
+                (TokenType::Comma | TokenType::LeftBrace, TokenType::RightBrace) => {
+                    self.current += 1;
+                    break;
+                }
+                (TokenType::RightBrace, _) => break,
+                (_, TokenType::Identifier(ident)) => {
+                    idents.push(ident);
+                    self.current += 1;
+                    if let TokenType::Colon = self.tokens[self.current].token_type {
+                        self.current += 1;
+                    } else {
+                        return Err(ResError::new_err(
+                            ResErrorKind::ExpectedTypeIdentifier,
+                            position,
+                        ));
+                    }
+                    let node = self.parse_equality()?;
+                    nodes.push(node);
+                    self.current += 1;
+                }
+                _ => {
+                    return Err(ResError::new_err(
+                        ResErrorKind::ExpectedIdentifier,
+                        position,
+                    ));
+                }
+            }
+        }
+        Ok(Node::Constructor(
+            i.clone(),
+            idents.into_iter().zip(nodes).collect(),
+            position,
+        ))
+    }
     fn parse_var_identifier(&mut self) -> ResResult<Node> {
+        self.debug("parse_var_identifier");
         let position = self.tokens[self.current].position.clone();
         if let TokenType::Identifier(i) = self.tokens[self.current].token_type.clone() {
             Ok(Node::Identifier(i, position))
@@ -862,11 +1136,18 @@ impl AstFactory {
                 self.current += 1;
                 Ok(())
             } else {
-                Err(ResError::new_err(ResErrorKind::ExpectedSemicolon, self.tokens[self.current - 1].position))
+                Err(ResError::new_err(
+                    ResErrorKind::ExpectedSemicolon(self.tokens[self.current].clone()),
+                    self.tokens[self.current - 1].position,
+                ))
             }
         } else {
             Ok(())
         }
+    }
+
+    fn debug(&self, func: &str) {
+        //println!("{}:\ttoken = {}", func, self.tokens[self.current]);
     }
 }
 
@@ -923,9 +1204,42 @@ impl Display for Node {
             } => write!(f, "({} {} {})", operator, left, right),
             Node::Parenthesis(e) => write!(f, "(group {})", e),
             Node::Identifier(i, _) => write!(f, "_{}", i),
+            Node::FieldAccess(i, s, _) => write!(f, "_{}.{}", i, s),
+            Node::Address(_, n, _) => write!(f, "&{}", n),
+            Node::Deref(n, _) => write!(f, "*{}", n),
             Node::FuncIdentifier(i, a, _) => write!(f, "_{}({:?})", i, a),
             Node::Assignment(i, v, _) => write!(f, "{} = {}", i, v),
+            Node::Block(block) => {
+                writeln!(f, "block: {}\n", block)
+            }
+            Node::Loop(block) => {
+                writeln!(f, "loop: {}\n", block)
+            }
+            Node::If(condition, then, els, _) => {
+                writeln!(f, "if {}", condition)?;
+                writeln!(f, "then {}", then)?;
+                if let Some(el) = els {
+                    writeln!(f, "else {}", el)?;
+                }
+                Ok(())
+            }
+            Node::Constructor(ident, args, _) => {
+                write!(f, "construct {} {{{:#?}}}", ident, args)
+            }
         }
+    }
+}
+
+impl Display for Block {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "block: {{\n")?;
+        for stmnt in &self.stmts {
+            writeln!(f, "\t{}", stmnt)?;
+        }
+        if let Some(s) = &self.tail {
+            writeln!(f, "\t{}", s)?;
+        }
+        writeln!(f, "}}\n")
     }
 }
 
@@ -945,6 +1259,7 @@ impl std::fmt::Debug for Node {
             Node::Identifier(i, _) => write!(f, "_{}", i),
             Node::FuncIdentifier(i, a, _) => write!(f, "_{}({:?})", i, a),
             Node::Assignment(i, v, _) => write!(f, "{} = {}", i, v),
+            el => write!(f, "{}", el),
         }
     }
 }

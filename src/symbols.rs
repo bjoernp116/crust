@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::{functions::FuncID, types::InferedType};
+use crate::{error::ResResult, functions::FuncID, ssa::{SlotID, ValueID}, types::{InferedType, TypeHandler}};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SymbolID(pub usize);
@@ -12,16 +12,24 @@ pub struct ScopeID(pub usize);
 pub struct Symbol {
     pub identifier: String,
     pub typeid: InferedType,
+    pub mutable: bool,
+}
+
+impl Symbol {
+    pub fn is_scalar(&self, th: &TypeHandler) -> ResResult<bool> {
+        Ok(!self.mutable && th.is_scalar(&self.typeid.typeid)?)
+    }
 }
 
 #[derive(Debug)]
 pub struct SymbolTable {
     symbols: Vec<Symbol>,
+    refs_table: HashSet<SymbolID>
 }
 
 impl SymbolTable {
     pub fn new() -> Self {
-        Self { symbols: Vec::new() }
+        Self { symbols: Vec::new(), refs_table: HashSet::new() }
     }
 
     pub fn insert(&mut self, symbol: Symbol) -> SymbolID {
@@ -30,7 +38,16 @@ impl SymbolTable {
         id
     }
 
-    pub fn get(&mut self, id: SymbolID) -> &Symbol {
+    pub fn set_referenced(&mut self, symbol: SymbolID) {
+        self.refs_table.insert(symbol);
+    }
+
+    pub fn can_value_allocate(&self, id: &SymbolID, th: &TypeHandler) -> ResResult<bool> {
+        let symbol = self.get(id);
+        Ok(symbol.is_scalar(th)? && self.refs_table.get(id).is_none())
+    }
+
+    pub fn get(&self, id: &SymbolID) -> &Symbol {
         &self.symbols[id.0]
     }
 
@@ -53,9 +70,12 @@ pub struct Scope {
 
 impl Scope {
     pub fn new_global() -> Self {
+        let mut bindings = HashMap::new();
+        bindings.insert("write".to_owned(), Binding::Function(FuncID(0)));
+        bindings.insert("exit".to_owned(), Binding::Function(FuncID(1)));
         Self {
             parent: None,
-            bindings: HashMap::new(),
+            bindings,
         }
     }
     pub fn new(parent: ScopeID) -> Self {
@@ -121,3 +141,10 @@ impl ScopeTable {
         self.scopes[self.current_scope.0].bindings.insert(identifier, id);
     }
 }
+
+pub enum SymbolBinding {
+    Stack(SlotID),
+    Value(ValueID)
+}
+
+
