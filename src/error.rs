@@ -141,6 +141,8 @@ pub enum ResErrorKind {
     ExpectedPlaceSymbol,
     ExpectedScalar(TypedNode),
     ControlFlowExited,
+    Unreachable,
+    ExpectedReturnValue(TypeID),
 }
 
 impl ResErrorKind {
@@ -163,7 +165,7 @@ impl ResErrorKind {
             ),
             Self::CantDeref(ty) => format!("cannot dereference type {}", th.get(ty, pos)?.identifier.blue()),
             Self::FieldNotFound(field, ty) => {
-                format!("field {} not found on type {:?}", field, th.get(ty, pos)?.identifier.blue())
+                format!("field {} not found on type {}", field, th.get(ty, pos)?.identifier.blue())
             }
             Self::ExpectedNumerical(got) => format!(
                 "expected numerical type, got {}",
@@ -180,6 +182,9 @@ impl ResErrorKind {
             }
             Self::ExpectedElse(t) => {
                 format!("expected else, then block has type {}", th.get(t, pos)?.identifier.blue())
+            }
+            Self::ExpectedReturnValue(t) => {
+                format!("expected to return a value of type {}", th.get(t, pos)?.identifier.blue())
             }
             el => format!("{:?}", el),
         })
@@ -277,7 +282,13 @@ impl Debug for ResErrorKind {
                 write!(f, "expected place for symbol")
             },
             Self::ControlFlowExited => {
-                write!(f, "this code is unreachable")
+                write!(f, "control flow has exited!")
+            },
+            Self::Unreachable => {
+                write!(f, "statement is unreachable")
+            },
+            Self::ExpectedReturnValue(_) => {
+                write!(f, "expected return value")
             }
         }
     }
@@ -354,7 +365,7 @@ impl<K: Eq + Hash + Clone + Debug> Setter<K> {
         }
         None
     }
-    
+
     pub fn drop(&mut self, key: &K) {
         if let Some(used) = self.used.get_mut(key) {
             *used = false;
@@ -363,6 +374,10 @@ impl<K: Eq + Hash + Clone + Debug> Setter<K> {
 
     pub fn left(&self) -> usize {
         self.used.iter().filter(|(_, v)| !*v).count()
+    }
+
+    pub fn is_used(&self, key: &K) -> bool {
+        self.used[key]
     }
 }
 

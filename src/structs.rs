@@ -50,7 +50,7 @@ impl Struct {
             let ty = type_handler.get(&field.ty, None).unwrap();
 
             let alignment = ty.size;
-
+            
             used = align_up(used, alignment);
 
             let location = StackLocation {
@@ -61,8 +61,10 @@ impl Struct {
             map.insert(FieldID(i), location);
             used += ty.size;
         }
-        used += 8 - (used % 8);
-        println!("{:#?}", map);
+        if used % 8 != 0 {
+            used += 8 - (used % 8);
+        }
+        println!("{:?}", map);
         StructFrame {
             stack_map: map,
             size: used,

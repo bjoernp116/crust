@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     asm::Register,
-    error::{Counter, ResError, ResErrorKind, ResResult, Severity},
+    error::{Counter, ResError, ResErrorKind, ResResult, Severity, print_err, unwrap_print},
     functions::FuncID,
     lexer::Position,
     locations::{Locator, StackLocation, ValueLocation},
@@ -90,7 +90,7 @@ impl Function {
                 .get(&sy)
                 .is_scalar(&tables.type_handler)?
             {
-                locator.new_symbol(ty, sy);
+                locator.new_symbol(ty, sy, &mut slot_table);
                 params.push(sy);
             } else {
                 slot_table.new_var(ty, sy);
@@ -106,11 +106,28 @@ impl Function {
             locator,
         };
         for stmt in body.stmts {
+            if let Terminator::Unknown = func.get_terminator() {
+            } else {
+                let _: () = print_err(
+                    ResError::new_warn(ResErrorKind::Unreachable, stmt.position()),
+                    &tables.file_contents,
+                    &tables.type_handler,
+                );
+            }
             func.parse_stmt(stmt, tables)?;
         }
         if let Some(tail) = body.tail {
             let value = func.parse_value(*tail, tables)?;
             func.set_terminator(Terminator::Return { value: Some(value) }, body.position)?;
+        } else {
+            if let Terminator::Unknown = func.get_terminator() {
+                if ret != TypeID::VOID {
+                    return Err(ResError::new_err(
+                        ResErrorKind::ExpectedReturnValue(ret),
+                        body.position,
+                    ));
+                }
+            }
         }
         //func.remove_dead_copies(tables);
         Ok(func)
@@ -118,36 +135,42 @@ impl Function {
 
     pub fn parse_stmt(&mut self, stmt: TypedStatement, tables: &mut Tables) -> ResResult<()> {
         match stmt {
-            TypedStatement::VarDecl(_, symbol_id, node) => {
+            TypedStatement::VarDecl(ident, symbol_id, node) => {
                 node.infered_type().assert(node.position())?;
                 if tables
                     .symbol_table
                     .can_value_allocate(&symbol_id, &tables.type_handler)?
                 {
-                    println!("value");
                     let symbol = tables.symbol_table.get(&symbol_id).clone();
-                    let value_id = self.locator.new_symbol(symbol.typeid.typeid, symbol_id);
+                    let value_id =
+                        self.locator
+                            .new_symbol(symbol.typeid.typeid, symbol_id, &mut self.slots);
                     self.parse_into(node, value_id, tables)?;
                 } else {
                     let symbol = tables.symbol_table.get(&symbol_id).clone();
-                    let node_value = self.parse_value(node, tables)?;
+                    let node_place = self.parse_place(node, tables)?;
                     let slot_id = self.slots.new_var(symbol.typeid.typeid, symbol_id);
                     let destination = Place {
                         kind: PlaceKind::Slot(slot_id),
                         offset: 0,
                         typeid: symbol.typeid.typeid,
                     };
-                    let op = Operation::Store(destination, node_value);
+                    let op = Operation::Copy(destination, node_place, symbol.typeid.typeid);
                     self.push(op);
-                    self.locator.drop(node_value);
                 }
             }
             TypedStatement::Return(_, opt) => {
                 if let Some(child) = opt {
                     let value = self.parse_value(child.clone(), tables)?;
-                    self.set_terminator(Terminator::Return { value: Some(value) }, child.position())?;
+                    self.set_terminator(
+                        Terminator::Return { value: Some(value) },
+                        child.position(),
+                    )?;
                 } else {
-                    self.set_terminator(Terminator::Return { value: None }, Position::new(0, 0, 0, 0))?;
+                    self.set_terminator(
+                        Terminator::Return { value: None },
+                        Position::new(0, 0, 0, 0),
+                    )?;
                 }
             }
             TypedStatement::Break(_, opt) => {
@@ -161,7 +184,6 @@ impl Function {
                         let place = self.parse_node(child, tables)?;
                         todo!()
                     }
-                    self.set_terminator(Terminator::Jump { destination: loop_merge.exit.clone() }, child.position())?;
                 }
             }
             TypedStatement::Expression(ty, node) => {
@@ -180,20 +202,35 @@ impl Function {
                     format!("while_merge"),
                     self.blocks.len() + 1,
                 );
-                self.set_terminator(Terminator::Branch { predicate, destination: loop_label.clone(), inverse: merge_label.clone() }, body.position)?;
-
+                self.set_terminator(
+                    Terminator::Branch {
+                        predicate,
+                        destination: loop_label.clone(),
+                        inverse: merge_label.clone(),
+                    },
+                    body.position,
+                )?;
+                self.locator.drop(predicate);
                 self.blocks.push(BasicBlock::new(loop_label.clone()));
                 self.loops.push(LoopMerge {
                     ty: TypeID::VOID,
                     exit: merge_label.clone(),
                     return_slot: None,
                 });
-                self.parse_block(body.clone(), TypeID::VOID, tables)?;
+                self.parse_block(body.clone(), tables)?;
                 self.loops.pop();
                 if let Terminator::Unknown = self.get_terminator() {
                     let continue_value = self.parse_value(pre, tables)?;
-                    self.set_terminator(Terminator::Branch { predicate: continue_value, destination: loop_label.clone(), inverse: merge_label.clone() }, body.position)?;
+                    self.set_terminator(
+                        Terminator::Branch {
+                            predicate: continue_value,
+                            destination: loop_label.clone(),
+                            inverse: merge_label.clone(),
+                        },
+                        body.position,
+                    )?;
                 }
+                self.locator.drop(predicate);
 
                 self.blocks.push(BasicBlock::new(merge_label.clone()));
             }
@@ -202,14 +239,16 @@ impl Function {
         Ok(())
     }
 
-    pub fn parse_block(
-        &mut self,
-        block: TypedBlock,
-        ty: TypeID,
-        tables: &mut Tables,
-    ) -> ResResult<OpOutput> {
-        let slot = self.locator.new_value(ty);
+    pub fn parse_block(&mut self, block: TypedBlock, tables: &mut Tables) -> ResResult<OpOutput> {
         for stmt in block.stmts {
+            if let Terminator::Unknown = self.get_terminator() {
+            } else {
+                let _: () = print_err(
+                    ResError::new_warn(ResErrorKind::Unreachable, stmt.position()),
+                    &tables.file_contents,
+                    &tables.type_handler,
+                );
+            }
             self.parse_stmt(stmt, tables)?;
         }
         if let Some(tail) = block.tail {
@@ -220,7 +259,84 @@ impl Function {
     }
 
     pub fn parse_place(&mut self, node: TypedNode, tables: &mut Tables) -> ResResult<Place> {
-        match node {
+        match node.clone() {
+            TypedNode::Constructor(id, fields, pos) => {
+                if let TypeKind::Structure(struct_id) =
+                    tables.type_handler.get(&id, Some(pos)).unwrap().kind
+                {
+                    let struc = tables.struct_table.get(struct_id).unwrap();
+                    let destination = self.slots.new_temp(id);
+                    let destination_place = Place {
+                        kind: PlaceKind::Slot(destination),
+                        offset: 0,
+                        typeid: id,
+                    };
+                    for (field_id, node) in fields {
+                        let field_type = struc.get_type(field_id);
+                        let field_offset = struc.get_offset(field_id, &tables.type_handler);
+                        let out_slot = self.parse_place(node, tables)?;
+                        let field = Place {
+                            kind: PlaceKind::Slot(destination),
+                            offset: field_offset,
+                            typeid: field_type,
+                        };
+                        self.copy_or_load(&field_type, field, out_slot, tables);
+                    }
+                    Ok(destination_place)
+                } else {
+                    Err(ResError::new_err(ResErrorKind::ExpectedStruct, pos))
+                }
+            }
+            TypedNode::Litteral(ty, litt, _) => match litt {
+                Litteral::String(string) => {
+                    let slot_id = self.slots.new_temp(tables.type_handler.u8_ref());
+                    let buffer_value = self
+                        .locator
+                        .new_value(tables.type_handler.u8_ref(), &mut self.slots);
+                    let op = Operation::ConstStr(buffer_value, string.clone());
+                    self.push(op);
+                    let buffer_field = Place {
+                        kind: PlaceKind::Slot(slot_id),
+                        offset: 0,
+                        typeid: tables.type_handler.u8_ref(),
+                    };
+                    let op = Operation::Store(buffer_field, buffer_value);
+                    self.locator.drop(buffer_value);
+                    self.push(op);
+                    let length_value = self.locator.new_value(TypeID::U64, &mut self.slots);
+                    let op = Operation::Const(
+                        length_value,
+                        Litteral::Number(
+                            string.len() - string.chars().filter(|c| *c == '\\').count(),
+                        ),
+                    );
+                    self.push(op);
+                    let length_field = Place {
+                        kind: PlaceKind::Slot(slot_id),
+                        offset: 8,
+                        typeid: TypeID::U64,
+                    };
+                    let op = Operation::Store(length_field, length_value);
+                    self.locator.drop(length_value);
+                    self.push(op);
+                    let place = Place {
+                        kind: PlaceKind::Slot(slot_id),
+                        offset: 0,
+                        typeid: ty.typeid,
+                    };
+                    Ok(place)
+                }
+                _ => {
+                    let value = self.parse_value(node, tables)?;
+                    let place = Place {
+                        kind: PlaceKind::Slot(self.slots.new_temp(ty.typeid)),
+                        offset: 0,
+                        typeid: ty.typeid,
+                    };
+                    self.push(Operation::Store(place.clone(), value));
+                    Ok(place)
+                }
+            },
             TypedNode::Identifier(ty, sym, _) => {
                 if tables
                     .symbol_table
@@ -245,8 +361,11 @@ impl Function {
             }
             TypedNode::FieldAccess(ty, base, field, pos) => {
                 let base_place = self.parse_place(*base, tables)?;
-                if let TypeKind::Structure(struct_id) =
-                    tables.type_handler.get(&ty.typeid, Some(pos)).unwrap().kind
+                if let TypeKind::Structure(struct_id) = tables
+                    .type_handler
+                    .get(&base_place.typeid, Some(pos))
+                    .unwrap()
+                    .kind
                 {
                     let struc = tables.struct_table.get(struct_id).unwrap();
                     let field_type = struc.get_type(field);
@@ -257,6 +376,7 @@ impl Function {
                         typeid: field_type,
                     })
                 } else {
+                    println!("{:?}", &ty.typeid);
                     Err(ResError::new_err(ResErrorKind::ExpectedStruct, pos))
                 }
             }
@@ -269,6 +389,10 @@ impl Function {
                     typeid: ty.typeid,
                 })
             }
+            TypedNode::Address(ty, mutable, node, _) => {
+                todo!()
+            }
+            TypedNode::Parenthesis(_, node) => self.parse_place(*node, tables),
             _ => Err(ResError::new_err(
                 ResErrorKind::ExpectedPlace(node.clone()),
                 node.position(),
@@ -286,19 +410,20 @@ impl Function {
                     ));
                 }
 
-                let destination = self.locator.new_value(place.typeid);
+                let destination = self.locator.new_value(place.typeid, &mut self.slots);
 
                 self.push(Operation::Load(destination, place));
 
                 Ok(destination)
             }
-            OpOutput::Unit => Ok(self.locator.new_value(TypeID::VOID)),
-            _ => todo!()
+            OpOutput::Unit => Ok(self.locator.new_value(TypeID::VOID, &mut self.slots)),
+            _ => todo!(),
         }
     }
     pub fn parse_node(&mut self, node: TypedNode, tables: &mut Tables) -> ResResult<OpOutput> {
         match node.clone() {
             TypedNode::Constructor(id, fields, pos) => {
+                panic!("node");
                 if let TypeKind::Structure(struct_id) =
                     tables.type_handler.get(&id, Some(pos)).unwrap().kind
                 {
@@ -326,54 +451,15 @@ impl Function {
                 }
             }
             TypedNode::Litteral(ty, litt, _) => match litt {
-                Litteral::String(string) => {
-                    let slot_id = self.slots.new_temp(ty.typeid);
-                    let slot_base = Place {
-                        kind: PlaceKind::Slot(slot_id),
-                        offset: 0,
-                        typeid: ty.typeid,
-                    };
-
-                    let buffer_value = self.locator.new_value(ty.typeid);
-                    let op = Operation::ConstStr(buffer_value, string.clone());
-                    self.push(op);
-                    let buffer_field = Place {
-                        kind: PlaceKind::Slot(slot_id),
-                        offset: 0,
-                        typeid: tables.type_handler.u8_ref(),
-                    };
-                    let op = Operation::Store(buffer_field, buffer_value);
-                    self.locator.drop(buffer_value);
-                    self.push(op);
-                    let length_value = self.locator.new_value(TypeID::U64);
-                    let op = Operation::Const(length_value, Litteral::Number(string.len()));
-                    self.push(op);
-                    let length_field = Place {
-                        kind: PlaceKind::Slot(slot_id),
-                        offset: 8,
-                        typeid: TypeID::U64,
-                    };
-                    let op = Operation::Store(length_field, length_value);
-                    self.locator.drop(length_value);
-                    self.push(op);
-                    let place = Place {
-                        kind: PlaceKind::Slot(slot_id),
-                        offset: 0,
-                        typeid: ty.typeid,
-                    };
-                    Ok(OpOutput::Memory(place))
-                }
+                Litteral::String(string) => todo!(),
                 _ => {
-                    let value = self.locator.new_value(ty.typeid);
+                    let value = self.locator.new_value(ty.typeid, &mut self.slots);
                     let op = Operation::Const(value, litt);
                     self.push(op);
                     Ok(OpOutput::Scalar(value))
                 }
             },
-            TypedNode::Block(ty, block) => {
-                self.parse_block(block, ty.typeid, tables)?;
-                todo!()
-            }
+            TypedNode::Block(ty, block) => self.parse_block(block, tables),
             TypedNode::Loop(ty, block) => {
                 let loop_label = BlockLabel(
                     self.identifier.clone(),
@@ -385,7 +471,12 @@ impl Function {
                     format!("loop_merge"),
                     self.blocks.len() + 1,
                 );
-                self.set_terminator(Terminator::Jump { destination: loop_label.clone() }, block.position)?;
+                self.set_terminator(
+                    Terminator::Jump {
+                        destination: loop_label.clone(),
+                    },
+                    block.position,
+                )?;
                 let return_slot = self.slots.new_temp(ty.typeid);
                 self.loops.push(LoopMerge {
                     ty: ty.typeid,
@@ -393,10 +484,15 @@ impl Function {
                     return_slot: Some(return_slot),
                 });
                 self.blocks.push(BasicBlock::new(loop_label.clone()));
-                let _ = self.parse_block(block.clone(), ty.typeid, tables)?;
+                let _ = self.parse_block(block.clone(), tables)?;
                 self.loops.pop();
                 if let Terminator::Unknown = self.get_terminator() {
-                    self.set_terminator(Terminator::Jump { destination: loop_label }, block.position)?;
+                    self.set_terminator(
+                        Terminator::Jump {
+                            destination: loop_label,
+                        },
+                        block.position,
+                    )?;
                 }
 
                 self.blocks.push(BasicBlock::new(merge_label.clone()));
@@ -422,17 +518,35 @@ impl Function {
                         format!("if_else"),
                         self.blocks.len() + 1,
                     );
-                    self.set_terminator(Terminator::Branch { predicate, destination: then_label.clone(), inverse: else_label.clone() }, pos)?;
+                    self.set_terminator(
+                        Terminator::Branch {
+                            predicate,
+                            destination: then_label.clone(),
+                            inverse: else_label.clone(),
+                        },
+                        pos,
+                    )?;
+                    self.locator.drop(predicate);
                     self.blocks.push(BasicBlock::new(then_label.clone()));
-                    let then_res = self.parse_block(body.clone(), ty.typeid, tables)?;
+                    let then_res = self.parse_block(body.clone(), tables)?;
                     if let Terminator::Unknown = self.get_terminator() {
-                        self.set_terminator(Terminator::Jump { destination: merge_label.clone() }, body.position)?;
+                        self.set_terminator(
+                            Terminator::Jump {
+                                destination: merge_label.clone(),
+                            },
+                            body.position,
+                        )?;
                     }
 
                     self.blocks.push(BasicBlock::new(else_label.clone()));
-                    let else_res = self.parse_block(else_body.clone(), ty.typeid, tables)?;
+                    let else_res = self.parse_block(else_body.clone(), tables)?;
                     if let Terminator::Unknown = self.get_terminator() {
-                        self.set_terminator(Terminator::Jump { destination: merge_label.clone() }, else_body.position)?;
+                        self.set_terminator(
+                            Terminator::Jump {
+                                destination: merge_label.clone(),
+                            },
+                            else_body.position,
+                        )?;
                     }
                     self.blocks.push(BasicBlock::new(merge_label));
                     match (then_res, else_res) {
@@ -445,22 +559,26 @@ impl Function {
                                     pos,
                                 ));
                             }
-                            let out_value = self.locator.new_value(then_type);
+                            let out_value = self.locator.new_value(then_type, &mut self.slots);
                             let op = Operation::Move(out_value, then_value);
+                            self.locator.drop(then_value);
                             self.blocks[then_label.2].operations.push(op);
 
                             let op = Operation::Move(out_value, else_value);
+                            self.locator.drop(else_value);
                             self.blocks[else_label.2].operations.push(op);
 
                             Ok(OpOutput::Scalar(out_value))
                         }
-                        (
-                            OpOutput::Memory(then_place),
-                            OpOutput::Memory(else_place),
-                        ) => {
-                            if &then_place.typeid != &else_place.typeid || &then_place.offset != &else_place.offset {
+                        (OpOutput::Memory(then_place), OpOutput::Memory(else_place)) => {
+                            if &then_place.typeid != &else_place.typeid
+                                || &then_place.offset != &else_place.offset
+                            {
                                 return Err(ResError::new_err(
-                                    ResErrorKind::TypeMismatch(then_place.typeid, else_place.typeid),
+                                    ResErrorKind::TypeMismatch(
+                                        then_place.typeid,
+                                        else_place.typeid,
+                                    ),
                                     pos,
                                 ));
                             }
@@ -468,24 +586,37 @@ impl Function {
                             let out_place = Place {
                                 kind: PlaceKind::Slot(self.slots.new_temp(then_place.typeid)),
                                 offset: then_place.offset,
-                                typeid: then_place.typeid
-                                
+                                typeid: then_place.typeid,
                             };
-                            let op = Operation::Copy(out_place.clone(), then_place.clone(), then_place.typeid);
+                            let op = Operation::Copy(
+                                out_place.clone(),
+                                then_place.clone(),
+                                then_place.typeid,
+                            );
                             self.blocks[then_label.2].operations.push(op);
 
-                            let op = Operation::Copy(out_place.clone(), else_place.clone(), else_place.typeid);
+                            let op = Operation::Copy(
+                                out_place.clone(),
+                                else_place.clone(),
+                                else_place.typeid,
+                            );
                             self.blocks[else_label.2].operations.push(op);
 
                             Ok(OpOutput::Memory(out_place))
                         }
                         (OpOutput::Unit, OpOutput::Unit) => Ok(OpOutput::Unit),
-                        _ => todo!()
+                        _ => todo!(),
                     }
                 } else {
-                    self.set_terminator(Terminator::Branch { predicate, destination: then_label.clone(), inverse: merge_label.clone() }, pos)?;
-
-                    let out_slot_id = self.slots.new_temp(ty.typeid);
+                    self.set_terminator(
+                        Terminator::Branch {
+                            predicate,
+                            destination: then_label.clone(),
+                            inverse: merge_label.clone(),
+                        },
+                        pos,
+                    )?;
+                    self.locator.drop(predicate);
                     self.blocks.push(BasicBlock::new(then_label));
                     if let Some(tail) = body.tail.clone() {
                         if !tail.infered_type().strong || tail.infered_type().typeid == TypeID::VOID
@@ -496,8 +627,8 @@ impl Function {
                             ));
                         }
                     }
-                    let then_res = self.parse_block(body, ty.typeid, tables)?;
-                    if let Terminator::Unknown = self.get_terminator(){
+                    let then_res = self.parse_block(body, tables)?;
+                    if let Terminator::Unknown = self.get_terminator() {
                         self.blocks.push(BasicBlock::new(merge_label));
                     }
                     Ok(OpOutput::Unit)
@@ -512,7 +643,7 @@ impl Function {
             } => {
                 let left_slot = self.parse_value(*left, tables)?;
                 let right_slot = self.parse_value(*right, tables)?;
-                let slot_id = self.locator.new_value(typeid.typeid);
+                let slot_id = self.locator.new_value(typeid.typeid, &mut self.slots);
                 let op = operator.to_operation(typeid.typeid, slot_id, left_slot, right_slot);
                 self.push(op);
                 self.locator.drop(left_slot);
@@ -528,7 +659,8 @@ impl Function {
                         Ok(OpOutput::Scalar(value.clone()))
                     } else {
                         let source: Place = self.parse_place(node, tables)?;
-                        let destination: ValueID = self.locator.new_value(ty.typeid);
+                        let destination: ValueID =
+                            self.locator.new_value(ty.typeid, &mut self.slots);
 
                         self.push(Operation::Load(destination, source));
                         Ok(OpOutput::Scalar(destination))
@@ -541,7 +673,7 @@ impl Function {
             TypedNode::FieldAccess(ty, base, field_id, _) => {
                 if tables.type_handler.is_scalar(&ty.typeid)? {
                     let source: Place = self.parse_place(node, tables)?;
-                    let destination: ValueID = self.locator.new_value(ty.typeid);
+                    let destination: ValueID = self.locator.new_value(ty.typeid, &mut self.slots);
 
                     self.push(Operation::Load(destination, source));
                     Ok(OpOutput::Scalar(destination))
@@ -553,7 +685,7 @@ impl Function {
             TypedNode::Deref(ty, _, pos) => {
                 if tables.type_handler.is_scalar(&ty.typeid)? {
                     let source: Place = self.parse_place(node, tables)?;
-                    let destination: ValueID = self.locator.new_value(ty.typeid);
+                    let destination: ValueID = self.locator.new_value(ty.typeid, &mut self.slots);
 
                     self.push(Operation::Load(destination, source));
                     Ok(OpOutput::Scalar(destination))
@@ -564,14 +696,14 @@ impl Function {
             }
             TypedNode::Address(ty, _, child, _) => {
                 let source: Place = self.parse_place(*child, tables)?;
-                let destination: ValueID = self.locator.new_value(ty.typeid);
-
+                let _address_type = tables.type_handler.get(&ty.typeid, None);
+                let destination: ValueID = self.locator.new_value(ty.typeid, &mut self.slots);
                 self.push(Operation::AddressOf(destination, source));
                 Ok(OpOutput::Scalar(destination))
             }
             TypedNode::Unary(ty, operator, child, _) => {
                 let child_slot = self.parse_value(*child, tables)?;
-                let slot_id = self.locator.new_value(ty.typeid);
+                let slot_id = self.locator.new_value(ty.typeid, &mut self.slots);
                 let op = operator.to_operation(ty.typeid, slot_id, child_slot);
                 self.push(op);
                 Ok(OpOutput::Scalar(slot_id))
@@ -595,7 +727,7 @@ impl Function {
                     let value_id = self.parse_value(arg, tables)?;
                     ids.push(value_id);
                 }
-                let value = self.locator.new_value(ty);
+                let value = self.locator.new_value(ty, &mut self.slots);
                 let op = Operation::Call(value, id, ids);
                 self.push(op);
                 if ty == TypeID::NEVER {
@@ -606,6 +738,29 @@ impl Function {
         }
     }
 
+    pub fn parse_block_into(
+        &mut self,
+        block: TypedBlock,
+        tables: &mut Tables,
+        value: ValueID,
+    ) -> ResResult<()> {
+        for stmt in block.stmts {
+            if let Terminator::Unknown = self.get_terminator() {
+            } else {
+                let _: () = print_err(
+                    ResError::new_warn(ResErrorKind::Unreachable, stmt.position()),
+                    &tables.file_contents,
+                    &tables.type_handler,
+                );
+            }
+            self.parse_stmt(stmt, tables)?;
+        }
+        if let Some(tail) = block.tail {
+            self.parse_into(*tail, value, tables)?;
+        }
+        Ok(())
+    }
+
     fn parse_into(
         &mut self,
         node: TypedNode,
@@ -613,14 +768,30 @@ impl Function {
         tables: &mut Tables,
     ) -> ResResult<()> {
         match node {
+            TypedNode::FuncIdentifier(ty, id, args, pos) => {
+                let mut ids = Vec::new();
+                for arg in args {
+                    let value_id = self.parse_value(arg, tables)?;
+                    ids.push(value_id);
+                }
+                let op = Operation::Call(value, id, ids.clone());
+                for id in ids {
+                    self.locator.drop(id);
+                }
+                self.push(op);
+                if ty == TypeID::NEVER {
+                    self.set_terminator(Terminator::Unreachable, pos)?;
+                }
+            }
             TypedNode::Litteral(ty, litt, pos) => {
                 if let Litteral::String(_) = litt {
                     panic!("expected number");
                 }
                 let op = Operation::Const(value, litt);
                 self.push(op);
-            },
+            }
             TypedNode::If(ty, predicate, body, el, pos) => {
+                println!("if into");
                 let predicate = self.parse_value(*predicate, tables)?;
                 let then_label = BlockLabel(
                     self.identifier.clone(),
@@ -638,41 +809,44 @@ impl Function {
                         format!("if_else"),
                         self.blocks.len() + 1,
                     );
-                    self.set_terminator(Terminator::Branch { predicate, destination: then_label.clone(), inverse: else_label.clone() }, pos)?;
+                    self.set_terminator(
+                        Terminator::Branch {
+                            predicate,
+                            destination: then_label.clone(),
+                            inverse: else_label.clone(),
+                        },
+                        pos,
+                    )?;
+                    self.locator.drop(predicate);
                     self.blocks.push(BasicBlock::new(then_label.clone()));
-                    let then_res = self.parse_block(body.clone(), ty.typeid, tables)?;
+                    let then_res = self.parse_block_into(body.clone(), tables, value)?;
                     if let Terminator::Unknown = self.get_terminator() {
-                        self.set_terminator(Terminator::Jump { destination: merge_label.clone() }, body.position)?;
+                        self.set_terminator(
+                            Terminator::Jump {
+                                destination: merge_label.clone(),
+                            },
+                            body.position,
+                        )?;
                     }
 
                     self.blocks.push(BasicBlock::new(else_label.clone()));
-                    let else_res = self.parse_block(else_body.clone(), ty.typeid, tables)?;
+                    let else_res = self.parse_block_into(else_body.clone(), tables, value)?;
                     if let Terminator::Unknown = self.get_terminator() {
-                        self.set_terminator(Terminator::Jump { destination: merge_label.clone() }, else_body.position)?;
+                        self.set_terminator(
+                            Terminator::Jump {
+                                destination: merge_label.clone(),
+                            },
+                            else_body.position,
+                        )?;
                     }
                     self.blocks.push(BasicBlock::new(merge_label));
-                    match (then_res, else_res) {
-                        (OpOutput::Scalar(then_value), OpOutput::Scalar(else_value)) => {
-                            let then_type = self.locator.get(&then_value).typeid;
-                            let else_type = self.locator.get(&else_value).typeid;
-                            if then_type != else_type {
-                                return Err(ResError::new_err(
-                                    ResErrorKind::TypeMismatch(then_type, else_type),
-                                    pos,
-                                ));
-                            }
-                            let op = Operation::Move(value, then_value);
-                            self.blocks[then_label.2].operations.push(op);
-
-                            let op = Operation::Move(value, else_value);
-                            self.blocks[else_label.2].operations.push(op);
-                        },
-                        _ => todo!()
-                    }
                 }
             }
-
-            _ => todo!(),
+            n => {
+                let src = self.parse_value(n, tables)?;
+                self.push(Operation::Move(value, src));
+                self.locator.drop(src);
+            }
         }
 
         Ok(())
@@ -687,9 +861,6 @@ impl Function {
         let block: &mut BasicBlock = self.blocks.last_mut().unwrap();
         match block.terminator {
             Terminator::Unknown => block.terminator = terminator,
-            Terminator::Return { value: _ }=> {
-                return Err(ResError::new_warn(ResErrorKind::ControlFlowExited, pos));
-            }
             _ => (),
         };
         Ok(())
@@ -709,7 +880,7 @@ impl Function {
     ) {
         let ty = tables.type_handler.get(type_id, None).unwrap();
         if ty.size <= 8 {
-            let value = self.locator.new_value(type_id.clone());
+            let value = self.locator.new_value(type_id.clone(), &mut self.slots);
             self.push(Operation::Load(value, source));
             self.push(Operation::Store(destination, value));
             self.locator.drop(value);
@@ -723,9 +894,17 @@ impl Function {
 pub enum Terminator {
     Unknown,
     Unreachable,
-    Jump { destination: BlockLabel },
-    Branch { predicate: ValueID, destination: BlockLabel, inverse: BlockLabel },
-    Return { value: Option<ValueID> },
+    Jump {
+        destination: BlockLabel,
+    },
+    Branch {
+        predicate: ValueID,
+        destination: BlockLabel,
+        inverse: BlockLabel,
+    },
+    Return {
+        value: Option<ValueID>,
+    },
 }
 
 pub struct BasicBlock {
@@ -789,11 +968,18 @@ pub struct Place {
 }
 
 impl Place {
-    fn with_offset(&self, offset: usize, typeid: TypeID) -> Self {
+    pub fn offset(&self, offset: usize, typeid: TypeID) -> Self {
         Place {
             kind: self.kind.clone(),
-            offset,
+            offset: self.offset + offset,
             typeid,
+        }
+    }
+
+    pub fn is_pointer(&self) -> bool {
+        match self.kind {
+            PlaceKind::Slot(_) => false,
+            PlaceKind::Pointer(_) => true,
         }
     }
 }
@@ -835,27 +1021,20 @@ impl SlotTable {
 
     pub fn new_var(&mut self, type_id: TypeID, symbol_id: SymbolID) -> SlotID {
         let slot_id = SlotID(self.slots.len());
-        self.slots.push(Slot {
-            ty: type_id,
-            kind: SlotKind::Local(symbol_id),
-        });
+        self.slots.push(Slot { ty: type_id });
         self.bindings.insert(symbol_id, slot_id);
         slot_id
     }
 
     pub fn new_temp(&mut self, type_id: TypeID) -> SlotID {
         let slot_id = SlotID(self.slots.len());
-        self.slots.push(Slot {
-            ty: type_id,
-            kind: SlotKind::Temporary,
-        });
+        self.slots.push(Slot { ty: type_id });
         slot_id
     }
 
     pub fn get(&self, id: SlotID) -> &Slot {
         &self.slots[id.0]
     }
-
     pub fn lookup(&self, id: &SymbolID) -> Option<&SlotID> {
         self.bindings.get(id)
     }
@@ -868,9 +1047,10 @@ impl SlotTable {
                 continue;
             }
             let ty = type_handler.get(&slot.ty, None).unwrap();
-
             let alignment = ty.size;
-
+            if alignment == 0 {
+                continue;
+            }
             used = align_up(used, alignment);
 
             used += ty.size;
@@ -887,29 +1067,6 @@ impl SlotTable {
             size: used,
         }
     }
-
-    pub fn place_location(
-        &self,
-        place: PlaceKind,
-        structs: &StructTable,
-        type_handler: &TypeHandler,
-    ) -> ResResult<StackLocation> {
-        let frame = self.stack_frame(type_handler);
-        match place {
-            PlaceKind::Slot(s) => frame
-                .stack_map
-                .get(&s)
-                .ok_or(ResError {
-                    kind: ResErrorKind::SlotNotFound(s),
-                    position: None,
-                    severity: Severity::Error,
-                })
-                .map(|s| s.clone()),
-            PlaceKind::Pointer(place) => {
-                todo!()
-            }
-        }
-    }
 }
 
 pub fn align_up(value: usize, alignment: usize) -> usize {
@@ -920,17 +1077,10 @@ pub fn align_up(value: usize, alignment: usize) -> usize {
 pub struct Slot {
     pub ty: TypeID,
     //pub alignment: u32,
-    pub kind: SlotKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Eq, Ord)]
 pub struct ValueID(pub usize);
-
-#[derive(Debug)]
-pub enum SlotKind {
-    Local(SymbolID),
-    Temporary,
-}
 
 #[derive(Clone)]
 pub struct BlockLabel(String, String, usize);

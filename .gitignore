@@ -1,6 +1,7 @@
 /target
 *.pdf
 *.asm
+*.s
 test
 *.o
 Cargo.lock

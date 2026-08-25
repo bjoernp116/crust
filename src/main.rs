@@ -63,7 +63,6 @@ enum Command {
 
 fn main() -> anyhow::Result<()> {
     let args = CLI::parse();
-    println!("{}", args.optimize);
     let file_contents: String = if let Ok(fc) = read_to_string(&args.file_path) {
         fc.to_owned()
     } else {
@@ -130,8 +129,9 @@ fn main() -> anyhow::Result<()> {
                 typer.optimize_stmts(&mut typed_ast);
             }
 
-            let mut tables = typer.tables(type_handler);
-            let ssa = SSA::new(typed_ast, &mut tables);
+            let mut tables = typer.tables(type_handler, file_contents);
+            let ssa = unwrap_print(SSA::new(typed_ast, &mut tables, ), &tables.file_contents, &tables.type_handler);
+            println!("{:#?}", tables.type_handler);
             println!("{:#?}", ssa);
         }
         Command::Compile => {
@@ -151,15 +151,15 @@ fn main() -> anyhow::Result<()> {
                 typer.optimize_stmts(&mut typed_ast);
             }
 
-            let mut tables = typer.tables(type_handler);
-            let ssa = unwrap_print(SSA::new(typed_ast, &mut tables), &file_contents, &tables.type_handler);
+            let mut tables = typer.tables(type_handler, file_contents);
+            let ssa = unwrap_print(SSA::new(typed_ast, &mut tables, ), &tables.file_contents, &tables.type_handler);
             let mut writer = AsmWriter::new(tables);
-            //writer.generate_funcs(ssa.functions);
-            //println!("{}", writer.buffer());
+            writer.generate_funcs(ssa.functions);
+            println!("{}", writer.buffer());
 
             let output_paths = OutputPaths::new(args.file_path, args.output_dir)?;
-            //println!("{:#?}", output_paths);
-            //std::fs::write(&output_paths.asm_path, writer.buffer())?;
+            println!("{:#?}", output_paths);
+            std::fs::write(&output_paths.asm_path, writer.buffer())?;
         }
         Command::Run => {
             let tokens: Vec<Token> = lexer::scan(file_contents.clone())?;
@@ -178,15 +178,15 @@ fn main() -> anyhow::Result<()> {
                 typer.optimize_stmts(&mut typed_ast);
             }
 
-            let mut tables = typer.tables(type_handler);
-            let ssa = unwrap_print(SSA::new(typed_ast, &mut tables), &file_contents, &tables.type_handler);
+            let mut tables = typer.tables(type_handler, file_contents);
+            let ssa = unwrap_print(SSA::new(typed_ast, &mut tables, ), &tables.file_contents, &tables.type_handler);
             let mut writer = AsmWriter::new(tables);
-            //writer.generate_funcs(ssa.functions);
+            writer.generate_funcs(ssa.functions);
 
             let output_paths = OutputPaths::new(args.file_path, args.output_dir)?;
-            //println!("{:#?}", output_paths);
+            println!("{:#?}", output_paths);
             output_paths.clean()?;
-            //std::fs::write(&output_paths.asm_path, writer.buffer())?;
+            std::fs::write(&output_paths.asm_path, writer.buffer())?;
             output_paths.assemble()?;
             output_paths.run()?;
         }

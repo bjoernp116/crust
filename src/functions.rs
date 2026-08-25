@@ -22,10 +22,7 @@ pub struct FuncTable {
 impl FuncTable {
     pub fn new(th: &mut TypeHandler) -> Self {
         let mut functions = Vec::new();
-        let ref_u8 = th.lookup_or_define(TypeSyntax::Reference {
-            mutable: false,
-            pointee: Box::new(TypeSyntax::Raw("u8".to_owned())),
-        }).unwrap();
+        let ref_u8 = th.u8_ref();
         functions.push(FuncSignature {
             identifier: "crust_write".to_owned(),
             params: vec![ref_u8, TypeID::U64],

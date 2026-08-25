@@ -17,7 +17,8 @@ pub struct Symbol {
 
 impl Symbol {
     pub fn is_scalar(&self, th: &TypeHandler) -> ResResult<bool> {
-        Ok(!self.mutable && th.is_scalar(&self.typeid.typeid)?)
+        let res = !self.mutable && th.is_scalar(&self.typeid.typeid)?;
+        Ok(res)
     }
 }
 

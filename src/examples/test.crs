@@ -1,17 +1,436 @@
 
-fun main() -> u64 {
-    let a = 43;
-
-    let b = 23;
-
-    if (a <= b) {
-        add(a, &b)
-    } else {
-        exit(3);
-        0
-    }
+struct Position {
+    x: u64,
+    y: u64
 }
 
-fun add(a: u64, b: &u64) -> u64 {
-    return a + *b;
+struct Bird {
+    age: u16,
+    position: Position,
+    name: str
+}
+
+fun main() -> u64 {
+    // ---------------------------------------------------------
+    // Basic scalar values
+    // ---------------------------------------------------------
+
+    let a: u64 = 10;
+    let b: u64 = 20;
+
+    let sum: u64 = add(a, b);
+    // sum = 30
+
+
+    // ---------------------------------------------------------
+    // Block expressions
+    // ---------------------------------------------------------
+
+    let block_value: u64 = {
+        let x: u64 = 5;
+        let y: u64 = 7;
+
+        x + y
+    };
+
+    // block_value = 12
+
+
+    // ---------------------------------------------------------
+    // Shadowing
+    // ---------------------------------------------------------
+
+    let shadow: u64 = 2;
+
+    let shadow: u64 = {
+        let inner: u64 = shadow + 3;
+        inner * 2
+    };
+
+    // shadow = 10
+
+
+    // ---------------------------------------------------------
+    // If expressions
+    // ---------------------------------------------------------
+
+    let selected: u64 = if sum > 20 {
+        8
+    } else {
+        4
+    };
+
+    // selected = 8
+
+
+    let nested_if: u64 = if (selected == 8) {
+        if (block_value == 12) {
+            11
+        } else {
+            100
+        }
+    } else {
+        200
+    };
+
+
+    // nested_if = 11
+
+
+    // ---------------------------------------------------------
+    // Scalar references
+    // ---------------------------------------------------------
+
+    let number: u64 = 50;
+    let number_ref: &u64 = &number;
+
+    let loaded_number: u64 = *number_ref;
+
+
+    // loaded_number = 50
+
+
+    // Pass reference into a function.
+    let ref_result: u64 = add_ref(5, number_ref);
+
+    // ref_result = 55
+
+
+    // ---------------------------------------------------------
+    // Reference to a smaller integer
+    // ---------------------------------------------------------
+
+    let small: u16 = 6;
+    let small_ref: &u16 = &small;
+
+
+    let small_result: u16 = read_u16(small_ref);
+
+
+    // small_result = 6
+
+
+    // ---------------------------------------------------------
+    // Basic structs
+    // ---------------------------------------------------------
+
+    let position: Position = Position {
+        x: 12,
+        y: 45
+    };
+
+    let copied_position: Position = position;
+    let position_sum: u64 =
+        copied_position.x + copied_position.y;
+
+    // position_sum = 300
+
+
+
+    // ---------------------------------------------------------
+    // References to structs
+    // ---------------------------------------------------------
+
+    let position_ref: &Position = &position;
+
+    let position_from_ref: Position = *position_ref;
+
+    let deref_sum: u64 =
+        position_from_ref.x + position_from_ref.y;
+
+    // deref_sum = 300
+
+
+    // ---------------------------------------------------------
+    // Take address of a struct field
+    // ---------------------------------------------------------
+
+    let x_ref: &u64 = &position.y; 
+
+    let x_from_ref: u64 = *x_ref;
+
+    // x_from_ref = 100
+
+
+    // ---------------------------------------------------------
+    // Function taking a reference to a struct
+    // ---------------------------------------------------------
+
+    let position_result: u64 =
+        sum_position(&position);
+
+    // position_result = 300
+
+
+    // ---------------------------------------------------------
+    // Strings
+    // ---------------------------------------------------------
+
+    let hello: str = "hello";
+    print(&hello);
+
+    let separator: str = " ";
+    print(&separator);
+
+    let world: str = "world";
+    print(&world);
+
+    let newline: str = "\n";
+    print(&newline);
+
+
+    // ---------------------------------------------------------
+    // Copy a string aggregate
+    // ---------------------------------------------------------
+
+    let first_string: str = "first string\n";
+    let second_string: str = first_string;
+
+    print(&second_string);
+
+
+    // ---------------------------------------------------------
+    // Reference to a string
+    // ---------------------------------------------------------
+
+    let referenced_string: str = "through &str\n";
+    let referenced_string_ref: &str = &referenced_string;
+
+    print(referenced_string_ref);
+
+
+    // ---------------------------------------------------------
+    // Explicit dereference/copy of a str
+    // ---------------------------------------------------------
+
+    let copied_through_ref: str = *referenced_string_ref;
+
+    print(&copied_through_ref);
+
+
+    // ---------------------------------------------------------
+    // Nested aggregate
+    // ---------------------------------------------------------
+
+    let bird_name: str = "sparrow";
+
+    let bird: Bird = Bird {
+        age: 3,
+        position: Position {
+            x: 40,
+            y: 2
+        },
+        name: bird_name
+    };
+
+
+    // ---------------------------------------------------------
+    // Nested field access
+    // ---------------------------------------------------------
+
+    let bird_position_sum: u64 =
+        bird.position.x + bird.position.y;
+
+    // 42
+
+
+    // ---------------------------------------------------------
+    // Reference to nested field
+    // ---------------------------------------------------------
+
+    let bird_x_ref: &u64 =
+        &bird.position.x;
+
+    let bird_x: u64 =
+        *bird_x_ref;
+
+    // 40
+
+
+    // ---------------------------------------------------------
+    // Reference to entire nested struct
+    // ---------------------------------------------------------
+
+    let bird_position_ref: &Position =
+        &bird.position;
+
+    let bird_position_copy: Position =
+        *bird_position_ref;
+
+    let bird_position_copy_sum: u64 =
+        bird_position_copy.x + bird_position_copy.y;
+
+    // 42
+
+
+    // ---------------------------------------------------------
+    // Reference to whole Bird
+    // ---------------------------------------------------------
+
+    let bird_ref: &Bird = &bird;
+
+    let bird_age: u16 =
+        get_bird_age(bird_ref);
+
+    // 3
+
+
+    let bird_coord_sum: u64 =
+        get_bird_position_sum(bird_ref);
+
+    // 42
+
+
+    // ---------------------------------------------------------
+    // String field accessed through a struct reference
+    // ---------------------------------------------------------
+
+    print_bird_name(bird_ref);
+
+    let newline2: str = "\n";
+    print(&newline2);
+
+
+    // ---------------------------------------------------------
+    // More arithmetic through calls
+    // ---------------------------------------------------------
+
+    let arithmetic: u64 =
+        multiply(
+            add(2, 3),
+            add(4, 5)
+        );
+
+    // (2 + 3) * (4 + 5)
+    // 5 * 9 = 45
+
+
+    // ---------------------------------------------------------
+    // Nested block + if
+    // ---------------------------------------------------------
+
+    let complex: u64 = {
+        let first: u64 = 7;
+        let second: u64 = 8;
+
+        let result: u64 = if (first < second) {
+            {
+                let extra: u64 = 5;
+                first + second + extra
+            }
+        } else {
+            0
+        };
+
+        result
+    };
+
+    // complex = 20
+
+
+    // ---------------------------------------------------------
+    // Final calculation
+    //
+    // This gives us one value that depends on loads of previous
+    // features working correctly.
+    // ---------------------------------------------------------
+
+    let result: u64 =
+        selected
+        + nested_if
+        + loaded_number
+        + ref_result
+        + position_sum
+        + deref_sum
+        + x_from_ref
+        + position_result
+        + bird_position_sum
+        + bird_x
+        + bird_position_copy_sum
+        + bird_coord_sum
+        + arithmetic
+        + complex;
+
+    // Expected:
+    //
+    //   8
+    // + 11
+    // + 50
+    // + 55
+    // + 300
+    // + 300
+    // + 100
+    // + 300
+    // + 42
+    // + 40
+    // + 42
+    // + 42
+    // + 45
+    // + 20
+    //
+    // = 1355
+
+    exit(result)
+}
+
+
+fun add(a: u64, b: u64) -> u64 {
+    a + b
+}
+
+
+fun multiply(a: u64, b: u64) -> u64 {
+    a * b
+}
+
+
+fun add_ref(a: u64, b: &u64) -> u64 {
+    a + *b
+}
+
+
+fun read_u16(value: &u16) -> u16 {
+    *value
+}
+
+
+fun sum_position(position: &Position) -> u64 {
+    let copied: Position = *position;
+
+    copied.x + copied.y
+}
+
+
+fun get_bird_age(bird: &Bird) -> u16 {
+    let copied: Bird = *bird;
+
+    copied.age
+}
+
+
+fun get_bird_position_sum(bird: &Bird) -> u64 {
+    let copied: Bird = *bird;
+
+    copied.position.x + copied.position.y
+}
+
+
+fun print_bird_name(bird: &Bird) {
+    let copied: Bird = *bird;
+
+    print(&copied.name);
+
+    return;
+}
+
+
+fun print(s: &str) {
+    let string: str = *s;
+
+    write(
+        string.buffer,
+        string.length
+    );
+
+    return;
 }

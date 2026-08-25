@@ -64,6 +64,23 @@ pub struct Type {
     pub kind: TypeKind,
 }
 
+impl Type {
+    pub fn syntax(&self, th: &TypeHandler) -> ResResult<TypeSyntax> {
+        match self.kind {
+            TypeKind::Primitive | TypeKind::Structure(_) => {
+                Ok(TypeSyntax::Raw(self.identifier.clone()))
+            }
+            TypeKind::Reference(pointee) => {
+                let ty = th.get(&pointee, None)?;
+                Ok(TypeSyntax::Reference {
+                    mutable: false,
+                    pointee: Box::new(ty.syntax(th)?),
+                })
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum TypeKind {
     Primitive,
@@ -155,9 +172,28 @@ impl TypeHandler {
         handler
     }
 
+    pub fn inner_struct(&self, id: &TypeID, pos: Position) -> ResResult<StructID> {
+        let base_type = self.get(id, Some(pos))?;
+        match base_type.kind {
+            TypeKind::Structure(struct_id) => {
+                Ok(struct_id)
+            },
+            TypeKind::Reference(type_id) => {
+                self.inner_struct(&type_id, pos)
+            }
+            TypeKind::Primitive => {
+                return Err(ResError::new_err(
+                    ResErrorKind::ExpectedStruct,
+                    pos,
+                ));
+            }
+        }
+    }
+
     pub fn is_scalar(&self, id: &TypeID) -> ResResult<bool> {
-        match self.get(id, None)?.kind {
-            TypeKind::Primitive | TypeKind::Reference(_) => Ok(true),
+        let ty = self.get(id, None)?;
+        match ty.kind {
+            TypeKind::Primitive | TypeKind::Reference(_) => Ok(ty.size <= 8),
             _ => Ok(false),
         }
     }
@@ -269,6 +305,17 @@ impl TypedStatement {
             Self::Return(_, n) => n.into(),
             Self::Expression(_, n) => Some(n),
             _ => None,
+        }
+    }
+
+    pub fn position(&self) -> Position {
+        match self {
+            Self::Expression(_, n) => n.position(),
+            Self::Return(_, Some(n)) => n.position(),
+            Self::Break(_, Some(n)) => n.position(),
+            Self::VarDecl(_, _, n) => n.position(),
+            Self::While(n, b) => Position::range(n.position(), b.position),
+            _ => Position::new(0, 0, 0, 0),
         }
     }
 }
@@ -684,7 +731,7 @@ impl Typer {
                     Litteral::Nil => TypeID::VOID,
                     Litteral::Number(_) => TypeID::U64,
                     Litteral::Boolean(_) => TypeID::BOOL,
-                    _ => todo!(),
+                    Litteral::String(_) => TypeID::STR,
                 };
                 TypedNode::Litteral(
                     InferedType {
@@ -727,20 +774,11 @@ impl Typer {
             }
             Node::FieldAccess(base, field, pos) => {
                 let typed_base = self.resolve_node(*base, type_handler, &TypeID::VOID.weak())?;
-                let base_type = type_handler
-                    .get(&typed_base.infered_type().typeid, Some(pos))
-                    .unwrap();
-                if let TypeKind::Structure(struct_id) = base_type.kind {
-                    let struc = self.structs.get(struct_id).unwrap();
-                    let field_id = struc.lookup(&field, Some(pos)).unwrap();
-                    let field_type = struc.get_type(field_id);
-                    TypedNode::FieldAccess(field_type.strong(), Box::new(typed_base), field_id, pos)
-                } else {
-                    return Err(ResError::new_err(
-                        ResErrorKind::FieldNotFound(field, typed_base.infered_type().typeid),
-                        pos,
-                    ));
-                }
+                let struc_id = type_handler.inner_struct(&typed_base.infered_type().typeid, pos)?;
+                let struc = self.structs.get(struc_id).unwrap();
+                let field_id = struc.lookup(&field, Some(pos)).unwrap();
+                let field_type = struc.get_type(field_id);
+                TypedNode::FieldAccess(field_type.strong(), Box::new(typed_base), field_id, pos)
             }
             Node::Address(mutable, node, pos) => {
                 let typed_node = self.resolve_node(*node, type_handler, &TypeID::VOID.weak())?;
@@ -750,7 +788,7 @@ impl Typer {
                 let type_id = type_handler
                     .lookup_or_define(TypeSyntax::Reference {
                         mutable,
-                        pointee: Box::new(TypeSyntax::Raw(node_type.identifier.clone())),
+                        pointee: Box::new(node_type.syntax(&type_handler)?),
                     })
                     .unwrap();
                 let mut typed_node =
@@ -1232,13 +1270,14 @@ impl Typer {
         id
     }
 
-    pub fn tables(self, type_handler: TypeHandler) -> Tables {
+    pub fn tables(self, type_handler: TypeHandler, file_contents: String) -> Tables {
         Tables {
             symbol_table: self.symbols,
             type_handler,
             func_table: self.functions,
             scope_table: self.scopes,
             struct_table: self.structs,
+            file_contents,
         }
     }
 
@@ -1529,4 +1568,5 @@ pub struct Tables {
     pub func_table: FuncTable,
     pub scope_table: ScopeTable,
     pub struct_table: StructTable,
+    pub file_contents: String,
 }

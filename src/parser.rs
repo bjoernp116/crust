@@ -1,7 +1,11 @@
 use std::{collections::VecDeque, fmt::Display};
 
 use crate::{
-    error::{ResError, ResErrorKind, ResResult}, lexer::{Position, Token, TokenType}, locations::ValueLocation, ssa::{Operation, SlotID, ValueID}, types::TypeID
+    error::{ResError, ResErrorKind, ResResult},
+    lexer::{Position, Token, TokenType},
+    locations::ValueLocation,
+    ssa::{Operation, SlotID, ValueID},
+    types::TypeID,
 };
 
 #[derive(Clone)]
@@ -240,7 +244,13 @@ impl BinaryOperator {
             _ => true,
         }
     }
-    pub fn to_operation(&self, type_id: TypeID, dest: ValueID, x: ValueID, y: ValueID) -> Operation {
+    pub fn to_operation(
+        &self,
+        type_id: TypeID,
+        dest: ValueID,
+        x: ValueID,
+        y: ValueID,
+    ) -> Operation {
         use BinaryOperator::*;
         match self {
             Add => Operation::Add(type_id, dest, x, y),
@@ -592,7 +602,6 @@ impl AstFactory {
         if let Node::Identifier(identifier, pos) = n {
             if let TokenType::Colon = self.tokens[self.current].token_type {
                 self.current += 1;
-                println!("{}", self.tokens[self.current]);
                 let typename = self.parse_type_syntax()?;
                 if let TokenType::Comma = self.tokens[self.current].token_type {
                     self.current += 1;
@@ -677,14 +686,20 @@ impl AstFactory {
                     pointee: Box::new(TypeSyntax::Raw(base.clone())),
                 })
             } else {
-                Err(ResError::new_err(ResErrorKind::ExpectedIdentifier, self.tokens[self.current].position))
+                Err(ResError::new_err(
+                    ResErrorKind::ExpectedIdentifier,
+                    self.tokens[self.current].position,
+                ))
             }
         } else {
             if let TokenType::Identifier(base) = &self.tokens[self.current].token_type {
                 self.current += 1;
                 Ok(TypeSyntax::Raw(base.clone()))
             } else {
-                Err(ResError::new_err(ResErrorKind::ExpectedIdentifier, self.tokens[self.current].position))
+                Err(ResError::new_err(
+                    ResErrorKind::ExpectedIdentifier,
+                    self.tokens[self.current].position,
+                ))
             }
         }
     }
@@ -934,13 +949,9 @@ impl AstFactory {
         let node: Node = self.parse_field_access()?;
         let position = Position::range(op.position, node.position());
         match op.token_type {
-            TokenType::Reference => {
-                Ok(Node::Address(false, Box::new(node), position))
-            },
-            TokenType::Star => {
-                Ok(Node::Deref(Box::new(node), position))
-            },
-            _ => unreachable!()
+            TokenType::Reference => Ok(Node::Address(false, Box::new(node), position)),
+            TokenType::Star => Ok(Node::Deref(Box::new(node), position)),
+            _ => unreachable!(),
         }
     }
 
@@ -1237,7 +1248,7 @@ impl Display for Block {
             writeln!(f, "\t{}", stmnt)?;
         }
         if let Some(s) = &self.tail {
-            writeln!(f, "\t{}", s)?;
+            writeln!(f, "\ttail: {}", s)?;
         }
         writeln!(f, "}}\n")
     }

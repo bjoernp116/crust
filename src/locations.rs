@@ -1,6 +1,15 @@
-use std::{collections::{HashMap, HashSet}, fmt::Display};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+};
 
-use crate::{asm::Register, error::Setter, ssa::{Place, PlaceKind, ValueID}, symbols::SymbolID, types::{TypeHandler, TypeID}};
+use crate::{
+    asm::Register,
+    error::{ResError, ResErrorKind, Setter, Severity},
+    ssa::{Place, PlaceKind, SlotID, SlotTable, StackFrame, ValueID},
+    symbols::SymbolID,
+    types::{TypeHandler, TypeID},
+};
 
 #[derive(Debug)]
 pub struct Locator {
@@ -20,11 +29,9 @@ impl Locator {
                 Register::DI,
                 Register::R8,
                 Register::R9,
-                Register::R10,
-                Register::R11,
             ]),
             values: Vec::new(),
-            bindings: HashMap::new()
+            bindings: HashMap::new(),
         }
     }
 
@@ -32,36 +39,42 @@ impl Locator {
         self.bindings.get(id)
     }
 
-    pub fn new_value(&mut self, typeid: TypeID) -> ValueID {
+    pub fn new_value(&mut self, typeid: TypeID, slots: &mut SlotTable) -> ValueID {
         let id = ValueID(self.values.len());
-        let location = self.spill();
-        let value = Value {
-            location,
-            typeid, 
-        };
+        let location = self.spill(typeid, slots);
+        let value = Value { location, typeid, dropped: false };
         self.values.push(value);
         id
     }
 
-    pub fn new_symbol(&mut self, typeid: TypeID, id: SymbolID) -> ValueID {
+    pub fn new_symbol(&mut self, typeid: TypeID, id: SymbolID, slots: &mut SlotTable) -> ValueID {
         let value_id = ValueID(self.values.len());
-        let location = self.spill();
-        self.values.push(Value { location, typeid });
+        let location = self.spill(typeid, slots);
+        self.values.push(Value { location, typeid, dropped: false });
         self.bindings.insert(id, value_id);
         value_id
     }
 
-    fn spill(&mut self) -> ValueLocation {
+    pub fn spill(&mut self, typeid: TypeID, slots: &mut SlotTable) -> ValueLocation {
         if self.used_regs.left() != 0 {
             ValueLocation::Register(self.used_regs.get_unused().unwrap())
         } else {
-            todo!()
+            ValueLocation::Spill(slots.new_temp(typeid))
         }
     }
 
-    pub fn drop(&mut self, value: ValueID) {
-        let value = self.get(&value);
-        if let ValueLocation::Register(reg) = value.location {
+    pub fn drop(&mut self, value_id: ValueID) {
+        for v in self.bindings.values() {
+            let value = self.get(&value_id);
+            if let ValueLocation::Register(_) = value.location.clone() {
+                if value_id == *v {
+                    return;
+                }
+            }
+        }
+        let value = self.get_mut(&value_id);
+        if let ValueLocation::Register(reg) = value.location.clone() {
+            value.dropped = true;
             self.used_regs.drop(&reg);
         }
     }
@@ -70,22 +83,54 @@ impl Locator {
         self.values[value_id.0].clone()
     }
 
+    pub fn get_mut(&mut self, value_id: &ValueID) -> &mut Value {
+        &mut self.values[value_id.0]
+    }
 
-    pub fn display(&self, value_id: &ValueID, th: &TypeHandler) -> String {
+    pub fn display(&self, value_id: &ValueID, th: &TypeHandler, frame: &StackFrame) -> String {
         let value = self.get(value_id);
         match value.location {
             ValueLocation::Register(reg) => {
-                format!("{:?}", reg.with_size(th.get(&value.typeid, None).unwrap().size))
-            },
-            _ => todo!()
+                format!(
+                    "{}",
+                    reg.with_size(th.get(&value.typeid, None).unwrap().size)
+                )
+            }
+            ValueLocation::Spill(slot) => {
+                let location = frame
+                    .stack_map
+                    .get(&slot)
+                    .ok_or(ResError {
+                        kind: ResErrorKind::SlotNotFound(slot.clone()),
+                        position: None,
+                        severity: Severity::Error,
+                    })
+                    .map(|s| s.clone())
+                    .unwrap();
+                format!("{}", location)
+            }
         }
+    }
+
+    pub fn get_leaks(&self) -> Vec<(ValueID, Value)> {
+        self.values
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| {
+                if let ValueLocation::Register(reg) = &v.location {
+                    !v.dropped
+                } else {
+                    false
+                }
+            })
+            .map(|(i, v)| (ValueID(i), v.clone()))
+            .collect()
     }
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ValueLocation {
-    Spill(StackLocation),
+    Spill(SlotID),
     Register(Register),
 }
 
@@ -93,20 +138,12 @@ pub enum ValueLocation {
 pub struct Value {
     pub location: ValueLocation,
     pub typeid: TypeID,
+    pub dropped: bool,
 }
 
 impl Value {
     pub fn size(&self, th: &TypeHandler) -> usize {
         th.get(&self.typeid, None).unwrap().size
-    }
-}
-
-impl ValueLocation {
-    pub fn with_size(&self, size: usize) -> String {
-        match self {
-            Self::Spill(loc) => format!("{}", loc),
-            Self::Register(reg) => format!("{}", reg.with_size(size))
-        }
     }
 }
 
@@ -141,10 +178,8 @@ impl Display for StackLocation {
             2 => "word",
             4 => "dword",
             8 => "qword",
-            _ => "ERROR",
+            _ => panic!("Cant get pointer to stack loaction {:?}", self),
         };
         write!(f, "{} ptr [rbp - {}]", size, self.offset)
     }
 }
-
-
