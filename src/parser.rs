@@ -21,14 +21,17 @@ pub enum Node {
     Litteral(Litteral, Position),
     Identifier(String, Position),
     FieldAccess(Box<Node>, String, Position),
+    Index(Box<Node>, Box<Node>, Position),
     FuncIdentifier(String, Vec<Node>, Position),
     Assignment(Box<Node>, Box<Node>, Position),
     If(Box<Node>, Block, Option<Block>, Position),
     Block(Block),
     Loop(Block),
-    Constructor(String, Vec<(String, Node)>, Position),
+    StructConstructor(String, Vec<(String, Node)>, Position),
+    ArrayConstructor(Vec<Node>, Position),
     Address(bool, Box<Node>, Position),
     Deref(Box<Node>, Position),
+    Cast(Box<Node>, TypeSyntax, Position),
 }
 
 impl Node {
@@ -50,10 +53,13 @@ impl Node {
             Self::If(_, _, _, pos) => pos.clone(),
             Self::Block(block) => block.position.clone(),
             Self::Loop(block) => block.position.clone(),
-            Self::Constructor(_, _, pos) => pos.clone(),
+            Self::StructConstructor(_, _, pos) => pos.clone(),
+            Self::ArrayConstructor(_, pos) => pos.clone(),
             Self::FieldAccess(_, _, pos) => pos.clone(),
+            Self::Index(_, _, pos) => pos.clone(),
             Self::Address(_, _, pos) => pos.clone(),
             Self::Deref(_, pos) => pos.clone(),
+            Self::Cast(_, _, pos) => pos.clone(),
         }
     }
 }
@@ -75,7 +81,7 @@ impl Block {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Litteral {
     Number(usize),
     Boolean(bool),
@@ -89,6 +95,10 @@ pub enum TypeSyntax {
     Reference {
         mutable: bool,
         pointee: Box<TypeSyntax>,
+    },
+    Array {
+        element: Box<TypeSyntax>,
+        length: usize,
     },
 }
 
@@ -203,6 +213,7 @@ pub enum BinaryOperator {
     Mul,
     Div,
     Pow,
+    Mod,
 
     Eq,
     LEq,
@@ -256,7 +267,8 @@ impl BinaryOperator {
             Add => Operation::Add(type_id, dest, x, y),
             Sub => Operation::Sub(type_id, dest, x, y),
             Mul => Operation::Mul(type_id, dest, x, y),
-            Div => Operation::Div(type_id, dest, x, y),
+            Mod => Operation::Div(type_id, dest, x, y, true),
+            Div => Operation::Div(type_id, dest, x, y, false),
             Eq => Operation::Eq(type_id, dest, x, y),
             L => Operation::L(type_id, dest, x, y),
             LEq => Operation::LEq(type_id, dest, x, y),
@@ -296,6 +308,7 @@ impl Display for BinaryOperator {
             BinaryOperator::Add => "+",
             BinaryOperator::Sub => "-",
             BinaryOperator::Mul => "*",
+            BinaryOperator::Mod => "%",
             BinaryOperator::Div => "/",
             BinaryOperator::Pow => "^",
             BinaryOperator::Eq => "==",
@@ -369,21 +382,11 @@ impl AstFactory {
                     let variable_type =
                         if let TokenType::Colon = self.tokens[self.current].token_type {
                             self.current += 1;
-                            if let TokenType::Reference = self.tokens[self.current].token_type {
-                                self.current += 1;
-                                let base = self.tokens[self.current].raw.clone();
-                                Some(TypeSyntax::Reference {
-                                    mutable: false,
-                                    pointee: Box::new(TypeSyntax::Raw(base)),
-                                })
-                            } else {
-                                Some(TypeSyntax::Raw(self.tokens[self.current].raw.clone()))
-                            }
+                            let syntax = self.parse_type_syntax()?;
+                            Some(syntax)
                         } else {
-                            self.current -= 1;
                             None
                         };
-                    self.current += 1;
                     match self.tokens[self.current].token_type {
                         TokenType::SemiColon => {
                             let pos = self.tokens[self.current].position.clone();
@@ -622,28 +625,38 @@ impl AstFactory {
         let identifier: Node = self.parse_or()?;
         while self.current < self.tokens.len() {
             match self.tokens[self.current].token_type {
-                TokenType::Equal => {
-                    if let Node::Identifier(_, pos) = identifier.clone() {
+                TokenType::Equal => match identifier.clone() {
+                    Node::Identifier(_, pos) => {
                         self.current += 1;
                         let value = self.parse_assignment()?;
                         let position = Position::range(pos, value.position());
                         let node =
                             Node::Assignment(Box::new(identifier), Box::new(value), position);
                         return Ok(node);
-                    } else if let Node::FieldAccess(_, _, pos) = identifier.clone() {
+                    }
+                    Node::FieldAccess(_, _, pos) => {
                         self.current += 1;
                         let value = self.parse_assignment()?;
                         let position = Position::range(pos, value.position());
                         let node =
                             Node::Assignment(Box::new(identifier), Box::new(value), position);
                         return Ok(node);
-                    } else {
+                    }
+                    Node::Index(_, _, pos) => {
+                        self.current += 1;
+                        let value = self.parse_assignment()?;
+                        let position = Position::range(pos, value.position());
+                        let node =
+                            Node::Assignment(Box::new(identifier), Box::new(value), position);
+                        return Ok(node);
+                    }
+                    _ => {
                         return Err(ResError::new_err(
                             ResErrorKind::ExpectedIdentifier,
                             self.tokens[self.current].position,
                         ));
                     }
-                }
+                },
                 _ => break,
             }
         }
@@ -677,31 +690,50 @@ impl AstFactory {
 
     pub fn parse_type_syntax(&mut self) -> ResResult<TypeSyntax> {
         self.debug("parse_type_syntax");
-        if let TokenType::Reference = self.tokens[self.current].token_type {
-            self.current += 1;
-            if let TokenType::Identifier(base) = &self.tokens[self.current].token_type {
+        return match self.tokens[self.current].token_type.clone() {
+            TokenType::Reference => {
                 self.current += 1;
                 Ok(TypeSyntax::Reference {
                     mutable: false,
-                    pointee: Box::new(TypeSyntax::Raw(base.clone())),
+                    pointee: Box::new(self.parse_type_syntax()?),
                 })
-            } else {
-                Err(ResError::new_err(
-                    ResErrorKind::ExpectedIdentifier,
-                    self.tokens[self.current].position,
-                ))
             }
-        } else {
-            if let TokenType::Identifier(base) = &self.tokens[self.current].token_type {
+            TokenType::Identifier(ident) => {
                 self.current += 1;
-                Ok(TypeSyntax::Raw(base.clone()))
-            } else {
+                Ok(TypeSyntax::Raw(ident))
+            }
+            TokenType::LeftBlock => {
+                self.current += 1;
+                let element = self.parse_type_syntax()?;
+                if let TokenType::SemiColon = self.tokens[self.current].token_type {
+                    self.current += 1;
+                    if let TokenType::Number(length) = self.tokens[self.current].token_type {
+                        self.current += 2;
+                        Ok(TypeSyntax::Array {
+                            element: Box::new(element),
+                            length: length as usize,
+                        })
+                    } else {
+                        Err(ResError::new_err(
+                            ResErrorKind::ExpectedNumerical(TypeID::U32),
+                            self.tokens[self.current].position,
+                        ))
+                    }
+                } else {
+                    Err(ResError::new_err(
+                        ResErrorKind::ExpectedSemicolon(self.tokens[self.current].clone()),
+                        self.tokens[self.current].position,
+                    ))
+                }
+            }
+            _ => {
+                println!("{:?}", self.tokens[self.current].token_type);
                 Err(ResError::new_err(
                     ResErrorKind::ExpectedIdentifier,
                     self.tokens[self.current].position,
                 ))
             }
-        }
+        };
     }
 
     pub fn parse_and(&mut self) -> ResResult<Node> {
@@ -791,7 +823,7 @@ impl AstFactory {
         let mut node: Node = self.parse_exponent()?;
         while self.current < self.tokens.len() {
             match self.tokens[self.current].token_type {
-                TokenType::Star | TokenType::Slash => {
+                TokenType::Star | TokenType::Slash | TokenType::Percent => {
                     let op = self.tokens[self.current].clone();
                     self.current += 1;
                     if self.current >= self.tokens.len() {
@@ -814,7 +846,7 @@ impl AstFactory {
 
     fn parse_exponent(&mut self) -> ResResult<Node> {
         self.debug("parse_exponent");
-        let mut node: Node = self.parse_field_access()?;
+        let mut node: Node = self.parse_cast()?;
         while self.current < self.tokens.len() {
             match self.tokens[self.current].token_type {
                 TokenType::Carrot => {
@@ -838,6 +870,35 @@ impl AstFactory {
         Ok(node)
     }
 
+    fn parse_cast(&mut self) -> ResResult<Node> {
+        self.debug("parse_cast");
+        let mut node = self.parse_postfix()?;
+        while self.current < self.tokens.len() {
+            match self.tokens[self.current].token_type {
+                TokenType::As => {
+                    let op = self.tokens[self.current].clone();
+                    self.current += 1;
+                    if self.current >= self.tokens.len() {
+                        break;
+                    }
+                    let position =
+                        Position::range(node.position(), self.tokens[self.current].position);
+                    let identifier = match self.tokens[self.current].token_type.clone() {
+                        TokenType::Identifier(ident) => ident,
+                        _ => Err(ResError::new_err(
+                            ResErrorKind::ExpectedTypeIdentifier,
+                            position,
+                        ))?,
+                    };
+                    self.current += 1;
+                    node = Node::Cast(Box::new(node), TypeSyntax::Raw(identifier), position);
+                }
+                _ => break,
+            }
+        }
+        Ok(node)
+    }
+
     fn parse_primary(&mut self) -> ResResult<Node> {
         self.debug("parse_primary");
         if self.current >= self.tokens.len() {
@@ -848,6 +909,7 @@ impl AstFactory {
         }
         match self.tokens[self.current].token_type.clone() {
             TokenType::LeftParen => self.parse_paren(),
+            TokenType::LeftBlock => self.parse_array_constructor(),
             TokenType::Bang | TokenType::Minus => self.parse_unary(),
             TokenType::Reference | TokenType::Star => self.parse_address(),
             TokenType::LeftBrace => Ok(Node::Block(self.parse_block()?)),
@@ -936,7 +998,7 @@ impl AstFactory {
         self.debug("parse_unary");
         let op = self.tokens[self.current].clone();
         self.current += 1;
-        let node: Node = self.parse_field_access()?;
+        let node: Node = self.parse_postfix()?;
         let position = Position::range(op.clone().position, node.position());
         let unary = Node::Unary(op.try_into()?, Box::new(node), position);
         Ok(unary)
@@ -946,7 +1008,7 @@ impl AstFactory {
         self.debug("parse_address");
         let op = self.tokens[self.current].clone();
         self.current += 1;
-        let node: Node = self.parse_field_access()?;
+        let node: Node = self.parse_postfix()?;
         let position = Position::range(op.position, node.position());
         match op.token_type {
             TokenType::Reference => Ok(Node::Address(false, Box::new(node), position)),
@@ -955,8 +1017,8 @@ impl AstFactory {
         }
     }
 
-    fn parse_field_access(&mut self) -> ResResult<Node> {
-        self.debug("parse_field_access");
+    fn parse_postfix(&mut self) -> ResResult<Node> {
+        self.debug("parse_postfix");
         let mut node = self.parse_primary()?;
         while self.current < self.tokens.len() {
             match self.tokens[self.current].token_type {
@@ -975,10 +1037,62 @@ impl AstFactory {
                     let position = Position::range(node.position(), field_pos);
                     node = Node::FieldAccess(Box::new(node), field_name, position);
                 }
+                TokenType::LeftBlock => {
+                    self.current += 1;
+                    let index_node = self.parse_postfix()?;
+                    if let TokenType::RightBlock = self.tokens[self.current].token_type {
+                        self.current += 1;
+                    } else {
+                        return Err(ResError::new_err(
+                            ResErrorKind::ExpectedSeparator(self.tokens[self.current].clone()),
+                            self.tokens[self.current].position,
+                        ));
+                    }
+                    let position = Position::range(node.position(), index_node.position());
+                    node = Node::Index(Box::new(node), Box::new(index_node), position)
+                }
                 _ => break,
             }
         }
         Ok(node)
+    }
+
+    fn parse_array_constructor(&mut self) -> ResResult<Node> {
+        self.debug("parse_array_constructor");
+        let start_pos = self.tokens[self.current].position;
+        self.current += 1;
+        let mut nodes = Vec::new();
+        let end_pos: Position = loop {
+            if let TokenType::RightBlock = self.tokens[self.current].token_type {
+                self.current += 1;
+                break self.tokens[self.current - 1].position;
+            }
+            let node = self.parse_primary()?;
+            if let TokenType::SemiColon = self.tokens[self.current].token_type {
+                if nodes.len() == 0 {
+                    self.current += 1;
+                    let length_node = self.parse_number()?;
+                    if let Node::Litteral(Litteral::Number(n), _) = length_node {
+                        nodes.resize(n as usize, node);
+                        self.current += 1;
+                        break self.tokens[self.current].position;
+                    } 
+                }
+            }
+            nodes.push(node);
+            if let TokenType::Comma = self.tokens[self.current].token_type {
+                self.current += 1;
+                continue;
+            }
+            if let TokenType::RightBlock = self.tokens[self.current].token_type {
+                self.current += 1;
+                break self.tokens[self.current - 1].position;
+            }
+        };
+        Ok(Node::ArrayConstructor(
+            nodes,
+            Position::range(start_pos, end_pos),
+        ))
     }
 
     fn parse_paren(&mut self) -> ResResult<Node> {
@@ -1122,7 +1236,7 @@ impl AstFactory {
                 }
             }
         }
-        Ok(Node::Constructor(
+        Ok(Node::StructConstructor(
             i.clone(),
             idents.into_iter().zip(nodes).collect(),
             position,
@@ -1158,7 +1272,7 @@ impl AstFactory {
     }
 
     fn debug(&self, func: &str) {
-        //println!("{}:\ttoken = {}", func, self.tokens[self.current]);
+        println!("{}:\ttoken = {}", func, self.tokens[self.current]);
     }
 }
 
@@ -1170,6 +1284,7 @@ impl TryFrom<Token> for BinaryOperator {
             TokenType::Minus => Ok(BinaryOperator::Sub),
             TokenType::Star => Ok(BinaryOperator::Mul),
             TokenType::Slash => Ok(BinaryOperator::Div),
+            TokenType::Percent => Ok(BinaryOperator::Mod),
             TokenType::Carrot => Ok(BinaryOperator::Pow),
             TokenType::LessEqual => Ok(BinaryOperator::LEq),
             TokenType::GreaterEqual => Ok(BinaryOperator::GEq),
@@ -1206,6 +1321,7 @@ impl Display for Node {
         #![allow(unused)]
         match self {
             Node::Unary(op, e, _) => write!(f, "({} {})", op, e),
+            Node::Cast(op, e, _) => write!(f, "({} as {:?})", op, e),
             Node::Litteral(l, _) => write!(f, "{}", l),
             Node::Binary {
                 left,
@@ -1216,6 +1332,7 @@ impl Display for Node {
             Node::Parenthesis(e) => write!(f, "(group {})", e),
             Node::Identifier(i, _) => write!(f, "_{}", i),
             Node::FieldAccess(i, s, _) => write!(f, "_{}.{}", i, s),
+            Node::Index(i, s, _) => write!(f, "_{}[{}]", i, s),
             Node::Address(_, n, _) => write!(f, "&{}", n),
             Node::Deref(n, _) => write!(f, "*{}", n),
             Node::FuncIdentifier(i, a, _) => write!(f, "_{}({:?})", i, a),
@@ -1234,8 +1351,11 @@ impl Display for Node {
                 }
                 Ok(())
             }
-            Node::Constructor(ident, args, _) => {
+            Node::StructConstructor(ident, args, _) => {
                 write!(f, "construct {} {{{:#?}}}", ident, args)
+            }
+            Node::ArrayConstructor(args, _) => {
+                write!(f, "array {{{:#?}}}", args)
             }
         }
     }

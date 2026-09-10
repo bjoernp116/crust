@@ -57,6 +57,7 @@ impl Struct {
                 offset: used,
                 size: ty.size,
                 pointer: false,
+                type_id: field.ty
             };
             map.insert(FieldID(i), location);
             used += ty.size;
@@ -64,7 +65,6 @@ impl Struct {
         if used % 8 != 0 {
             used += 8 - (used % 8);
         }
-        println!("{:?}", map);
         StructFrame {
             stack_map: map,
             size: used,

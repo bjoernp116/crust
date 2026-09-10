@@ -74,6 +74,8 @@ impl Scope {
         let mut bindings = HashMap::new();
         bindings.insert("write".to_owned(), Binding::Function(FuncID(0)));
         bindings.insert("exit".to_owned(), Binding::Function(FuncID(1)));
+        bindings.insert("mmap".to_owned(), Binding::Function(FuncID(2)));
+        bindings.insert("munmap".to_owned(), Binding::Function(FuncID(3)));
         Self {
             parent: None,
             bindings,

@@ -41,4 +41,48 @@ crust_exit:
     syscall
     ret
 
-.size crust_exit, .-crust_exit
+
+.global crust_mmap
+.type crust_mmap, @function
+
+# crust_mmap(length: usize) -> void *
+#
+# System V function arguments:
+#   RDI = length
+#
+# Linux write syscall:
+#   RAX = syscall number
+#   RDI = exit code
+crust_mmap:
+    mov eax, 9
+    mov rsi, rdi
+    xor rdi, rdi
+    mov rdx, 3
+    mov r10, 0x22
+    mov r8, -1
+    xor r9, r9
+    syscall
+    ret
+
+
+.size crust_mmap, .-crust_mmap
+
+.global crust_munmap
+.type crust_munmap, @function
+
+# crust_munmap(addr: &u8, length: usize) -> u16
+#
+# System V function arguments:
+#   RDI = address 
+#   RSI = length
+#
+# Linux write syscall:
+#   RAX = syscall number
+#   RDI = exit code
+crust_munmap:
+    mov eax, 11
+    syscall
+    ret
+
+
+.size crust_munmap, .-crust_munmap

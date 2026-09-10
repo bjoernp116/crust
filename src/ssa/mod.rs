@@ -1,3 +1,7 @@
+mod operations;
+mod values;
+mod places;
+
 use std::{
     any::Any,
     collections::HashMap,
@@ -16,7 +20,8 @@ use crate::{
     structs::{FieldID, StructFrame, StructID, StructTable},
     symbols::{SymbolBinding, SymbolID, SymbolTable},
     types::{
-        InferedType, Tables, TypeHandler, TypeID, TypeKind, TypedBlock, TypedNode, TypedStatement,
+        Assignee, InferedType, Tables, TypeHandler, TypeID, TypeKind, TypedBlock, TypedNode,
+        TypedStatement,
     },
 };
 
@@ -118,7 +123,7 @@ impl Function {
         }
         if let Some(tail) = body.tail {
             let value = func.parse_value(*tail, tables)?;
-            func.set_terminator(Terminator::Return { value: Some(value) }, body.position)?;
+            func.set_terminator(Terminator::Return { value: Some(value) })?;
         } else {
             if let Terminator::Unknown = func.get_terminator() {
                 if ret != TypeID::VOID {
@@ -162,15 +167,9 @@ impl Function {
             TypedStatement::Return(_, opt) => {
                 if let Some(child) = opt {
                     let value = self.parse_value(child.clone(), tables)?;
-                    self.set_terminator(
-                        Terminator::Return { value: Some(value) },
-                        child.position(),
-                    )?;
+                    self.set_terminator(Terminator::Return { value: Some(value) })?;
                 } else {
-                    self.set_terminator(
-                        Terminator::Return { value: None },
-                        Position::new(0, 0, 0, 0),
-                    )?;
+                    self.set_terminator(Terminator::Return { value: None })?;
                 }
             }
             TypedStatement::Break(_, opt) => {
@@ -178,8 +177,6 @@ impl Function {
                 if let Some(child) = opt {
                     if let Some(return_slot) = loop_merge.return_slot {
                         let child_type = child.infered_type().typeid;
-                        let place = self.parse_place(child, tables)?;
-                        todo!()
                     } else {
                         let place = self.parse_node(child, tables)?;
                         todo!()
@@ -202,14 +199,11 @@ impl Function {
                     format!("while_merge"),
                     self.blocks.len() + 1,
                 );
-                self.set_terminator(
-                    Terminator::Branch {
-                        predicate,
-                        destination: loop_label.clone(),
-                        inverse: merge_label.clone(),
-                    },
-                    body.position,
-                )?;
+                self.set_terminator(Terminator::Branch {
+                    predicate,
+                    destination: loop_label.clone(),
+                    inverse: merge_label.clone(),
+                })?;
                 self.locator.drop(predicate);
                 self.blocks.push(BasicBlock::new(loop_label.clone()));
                 self.loops.push(LoopMerge {
@@ -221,14 +215,11 @@ impl Function {
                 self.loops.pop();
                 if let Terminator::Unknown = self.get_terminator() {
                     let continue_value = self.parse_value(pre, tables)?;
-                    self.set_terminator(
-                        Terminator::Branch {
-                            predicate: continue_value,
-                            destination: loop_label.clone(),
-                            inverse: merge_label.clone(),
-                        },
-                        body.position,
-                    )?;
+                    self.set_terminator(Terminator::Branch {
+                        predicate: continue_value,
+                        destination: loop_label.clone(),
+                        inverse: merge_label.clone(),
+                    })?;
                 }
                 self.locator.drop(predicate);
 
@@ -260,7 +251,7 @@ impl Function {
 
     pub fn parse_place(&mut self, node: TypedNode, tables: &mut Tables) -> ResResult<Place> {
         match node.clone() {
-            TypedNode::Constructor(id, fields, pos) => {
+            TypedNode::StructConstructor(id, fields, pos) => {
                 if let TypeKind::Structure(struct_id) =
                     tables.type_handler.get(&id, Some(pos)).unwrap().kind
                 {
@@ -287,9 +278,75 @@ impl Function {
                     Err(ResError::new_err(ResErrorKind::ExpectedStruct, pos))
                 }
             }
+            TypedNode::ArrayConstructor(ty, nodes, pos) => {
+                let array_type = tables.type_handler.get(&ty, Some(pos))?;
+                if let TypeKind::Array(element_id, length) = array_type.kind {
+                    let element_size = tables.type_handler.get(&element_id, Some(pos))?.size;
+                    let slot = self.slots.new_temp(ty);
+                    if nodes.iter().all(|n| n.equal_const(&nodes[0])) {
+                        let place = Place {
+                            kind: PlaceKind::Slot(slot),
+                            offset: 0,
+                            typeid: ty
+                        };
+                        let op = Operation::HugeConst(place, nodes[0].unwrap_const());
+                        if array_type.size >= 8 {
+                            self.push(op)
+                        }
+                        for i in 0..(array_type.size % 8) {
+                            let value = self.locator.new_value(element_id, &mut self.slots);
+                            let place = Place {
+                                kind: PlaceKind::Slot(slot),
+                                offset: array_type.size - (array_type.size % 8) + i * element_size,
+                                typeid: element_id,
+                            };
+                            let op = Operation::Const(value, nodes[0].unwrap_const());
+                            self.push(op);
+                            let op = Operation::Store(place, value);
+                            self.push(op);
+                        }
+                    } else {
+                        for (i, node) in nodes.iter().enumerate() {
+                            let value = self.parse_value(node.clone(), tables)?;
+                            let place = Place {
+                                kind: PlaceKind::Slot(slot),
+                                offset: i * element_size,
+                                typeid: element_id,
+                            };
+                            let op = Operation::Store(place, value);
+                            self.push(op);
+                        }
+                    }
+                    Ok(Place {
+                        kind: PlaceKind::Slot(slot),
+                        offset: 0,
+                        typeid: ty,
+                    })
+                } else {
+                    unreachable!()
+                }
+            }
+            TypedNode::Index(ty, base, index, _) => {
+                if tables.type_handler.is_scalar(&ty.typeid)? {
+                    let base = self.parse_place(*base, tables)?;
+                    let index = self.parse_value(*index, tables)?;
+                    
+                    let place = Place {
+                        kind: PlaceKind::Index {
+                            base: Box::new(base),
+                            index
+                        },
+                        offset: 0,
+                        typeid: ty.typeid,
+                    };
+                    Ok(place)
+                } else {
+                    todo!()
+                }
+            }
             TypedNode::Litteral(ty, litt, _) => match litt {
                 Litteral::String(string) => {
-                    let slot_id = self.slots.new_temp(tables.type_handler.u8_ref());
+                    let slot_id = self.slots.new_temp(TypeID::STR);
                     let buffer_value = self
                         .locator
                         .new_value(tables.type_handler.u8_ref(), &mut self.slots);
@@ -337,6 +394,30 @@ impl Function {
                     Ok(place)
                 }
             },
+            TypedNode::Binary {
+                typeid,
+                left,
+                right,
+                operator,
+                position: _,
+            } => {
+                let left_slot = self.parse_value(*left, tables)?;
+                let right_slot = self.parse_value(*right, tables)?;
+                let value_id = self.locator.new_value(typeid.typeid, &mut self.slots);
+                let op = operator.to_operation(typeid.typeid, value_id, left_slot, right_slot);
+                self.push(op);
+                self.locator.drop(left_slot);
+                self.locator.drop(right_slot);
+                let slot_id = self.slots.new_temp(typeid.typeid);
+                let place = Place {
+                    kind: PlaceKind::Slot(slot_id),
+                    offset: 0,
+                    typeid: typeid.typeid,
+                };
+                let op = Operation::Store(place.clone(), value_id);
+                self.push(op);
+                Ok(place)
+            }
             TypedNode::Identifier(ty, sym, _) => {
                 if tables
                     .symbol_table
@@ -420,9 +501,65 @@ impl Function {
             _ => todo!(),
         }
     }
+    pub fn resolve_place(&mut self, assignee: Assignee, tables: &mut Tables) -> ResResult<Place> {
+        println!("{:?}", assignee);
+        match &assignee {
+            Assignee::Symbol(sym) => {
+                let slot_id = self.slots.lookup(&sym).unwrap().clone();
+                println!("{:?} -> {:?}", tables.symbol_table.get(&sym).identifier, slot_id);
+                let slot = self.slots.get(slot_id);
+                let place = Place {
+                    kind: PlaceKind::Slot(slot_id),
+                    offset: 0,
+                    typeid: slot.ty,
+                };
+                Ok(place)
+            }
+            Assignee::Index { base, index } => {
+                let base_place = self.resolve_place(*base.clone(), tables)?;
+                let index_value = self.parse_value(*index.clone(), tables)?; 
+                let ty = tables.type_handler.get(&base_place.typeid, None)?;
+                if let TypeKind::Array(typeid, _) = ty.kind {
+                    let place = Place {
+                        kind: PlaceKind::Index { base: Box::new(base_place), index: index_value },
+                        offset: 0,
+                        typeid: typeid 
+                    };
+                    Ok(place)
+                } else {
+                    Err(ResError {
+                        kind: ResErrorKind::ExpectedArray(base_place.typeid),
+                        position: None,
+                        severity: Severity::Error,
+                    })
+                }
+            }
+            Assignee::Field { base, field } => {
+                let base_place = self.resolve_place(*base.clone(), tables)?;
+                let ty = tables.type_handler.get(&base_place.typeid, None)?;
+                if let TypeKind::Structure(struct_id) = ty.kind {
+                    let struc = tables.struct_table.get(struct_id).unwrap();
+                    let field_offset = struc.get_offset(field.clone(), &tables.type_handler);
+                    let field_type = struc.get_type(field.clone());
+                    Ok(base_place.offset(field_offset, field_type))
+                } else {
+                    Err(ResError {
+                        kind: ResErrorKind::ExpectedStruct,
+                        position: None,
+                        severity: Severity::Error,
+                    })
+                }
+            }
+            _ => todo!(),
+        }
+    }
+
+
+
     pub fn parse_node(&mut self, node: TypedNode, tables: &mut Tables) -> ResResult<OpOutput> {
         match node.clone() {
-            TypedNode::Constructor(id, fields, pos) => {
+            TypedNode::ArrayConstructor(_, _, _) => todo!(),
+            TypedNode::StructConstructor(id, fields, pos) => {
                 panic!("node");
                 if let TypeKind::Structure(struct_id) =
                     tables.type_handler.get(&id, Some(pos)).unwrap().kind
@@ -451,7 +588,44 @@ impl Function {
                 }
             }
             TypedNode::Litteral(ty, litt, _) => match litt {
-                Litteral::String(string) => todo!(),
+                Litteral::String(string) => {
+                    let slot_id = self.slots.new_temp(TypeID::STR);
+                    let buffer_value = self
+                        .locator
+                        .new_value(tables.type_handler.u8_ref(), &mut self.slots);
+                    let op = Operation::ConstStr(buffer_value, string.clone());
+                    self.push(op);
+                    let buffer_field = Place {
+                        kind: PlaceKind::Slot(slot_id),
+                        offset: 0,
+                        typeid: tables.type_handler.u8_ref(),
+                    };
+                    let op = Operation::Store(buffer_field, buffer_value);
+                    self.locator.drop(buffer_value);
+                    self.push(op);
+                    let length_value = self.locator.new_value(TypeID::U64, &mut self.slots);
+                    let op = Operation::Const(
+                        length_value,
+                        Litteral::Number(
+                            string.len() - string.chars().filter(|c| *c == '\\').count(),
+                        ),
+                    );
+                    self.push(op);
+                    let length_field = Place {
+                        kind: PlaceKind::Slot(slot_id),
+                        offset: 8,
+                        typeid: TypeID::U64,
+                    };
+                    let op = Operation::Store(length_field, length_value);
+                    self.locator.drop(length_value);
+                    self.push(op);
+                    let place = Place {
+                        kind: PlaceKind::Slot(slot_id),
+                        offset: 0,
+                        typeid: ty.typeid,
+                    };
+                    Ok(OpOutput::Memory(place))
+                }
                 _ => {
                     let value = self.locator.new_value(ty.typeid, &mut self.slots);
                     let op = Operation::Const(value, litt);
@@ -471,12 +645,9 @@ impl Function {
                     format!("loop_merge"),
                     self.blocks.len() + 1,
                 );
-                self.set_terminator(
-                    Terminator::Jump {
-                        destination: loop_label.clone(),
-                    },
-                    block.position,
-                )?;
+                self.set_terminator(Terminator::Jump {
+                    destination: loop_label.clone(),
+                })?;
                 let return_slot = self.slots.new_temp(ty.typeid);
                 self.loops.push(LoopMerge {
                     ty: ty.typeid,
@@ -487,12 +658,9 @@ impl Function {
                 let _ = self.parse_block(block.clone(), tables)?;
                 self.loops.pop();
                 if let Terminator::Unknown = self.get_terminator() {
-                    self.set_terminator(
-                        Terminator::Jump {
-                            destination: loop_label,
-                        },
-                        block.position,
-                    )?;
+                    self.set_terminator(Terminator::Jump {
+                        destination: loop_label,
+                    })?;
                 }
 
                 self.blocks.push(BasicBlock::new(merge_label.clone()));
@@ -518,35 +686,26 @@ impl Function {
                         format!("if_else"),
                         self.blocks.len() + 1,
                     );
-                    self.set_terminator(
-                        Terminator::Branch {
-                            predicate,
-                            destination: then_label.clone(),
-                            inverse: else_label.clone(),
-                        },
-                        pos,
-                    )?;
+                    self.set_terminator(Terminator::Branch {
+                        predicate,
+                        destination: then_label.clone(),
+                        inverse: else_label.clone(),
+                    })?;
                     self.locator.drop(predicate);
                     self.blocks.push(BasicBlock::new(then_label.clone()));
                     let then_res = self.parse_block(body.clone(), tables)?;
                     if let Terminator::Unknown = self.get_terminator() {
-                        self.set_terminator(
-                            Terminator::Jump {
-                                destination: merge_label.clone(),
-                            },
-                            body.position,
-                        )?;
+                        self.set_terminator(Terminator::Jump {
+                            destination: merge_label.clone(),
+                        })?;
                     }
 
                     self.blocks.push(BasicBlock::new(else_label.clone()));
                     let else_res = self.parse_block(else_body.clone(), tables)?;
                     if let Terminator::Unknown = self.get_terminator() {
-                        self.set_terminator(
-                            Terminator::Jump {
-                                destination: merge_label.clone(),
-                            },
-                            else_body.position,
-                        )?;
+                        self.set_terminator(Terminator::Jump {
+                            destination: merge_label.clone(),
+                        })?;
                     }
                     self.blocks.push(BasicBlock::new(merge_label));
                     match (then_res, else_res) {
@@ -608,14 +767,11 @@ impl Function {
                         _ => todo!(),
                     }
                 } else {
-                    self.set_terminator(
-                        Terminator::Branch {
-                            predicate,
-                            destination: then_label.clone(),
-                            inverse: merge_label.clone(),
-                        },
-                        pos,
-                    )?;
+                    self.set_terminator(Terminator::Branch {
+                        predicate,
+                        destination: then_label.clone(),
+                        inverse: merge_label.clone(),
+                    })?;
                     self.locator.drop(predicate);
                     self.blocks.push(BasicBlock::new(then_label));
                     if let Some(tail) = body.tail.clone() {
@@ -629,8 +785,11 @@ impl Function {
                     }
                     let then_res = self.parse_block(body, tables)?;
                     if let Terminator::Unknown = self.get_terminator() {
-                        self.blocks.push(BasicBlock::new(merge_label));
+                        self.set_terminator(Terminator::Jump {
+                            destination: merge_label.clone(),
+                        })?;
                     }
+                    self.blocks.push(BasicBlock::new(merge_label));
                     Ok(OpOutput::Unit)
                 }
             }
@@ -682,6 +841,33 @@ impl Function {
                     Ok(OpOutput::Memory(place))
                 }
             }
+            TypedNode::Index(ty, base, index, _) => {
+                if tables.type_handler.is_scalar(&ty.typeid)? {
+                    let base = self.parse_place(*base, tables)?;
+                    let array_type_syntax = tables
+                        .type_handler
+                        .get(&base.typeid, None)?
+                        .syntax(&tables.type_handler)?;
+                    let ref_array_syntax = TypeSyntax::Reference {
+                        mutable: false,
+                        pointee: Box::new(array_type_syntax),
+                    };
+                    let ref_array_type = tables
+                        .type_handler
+                        .lookup_or_define(ref_array_syntax)
+                        .unwrap();
+                    let base_ptr = self.locator.new_value(ref_array_type, &mut self.slots);
+                    let op = Operation::AddressOf(base_ptr, base);
+                    self.push(op);
+                    let index_value = self.parse_value(*index, tables)?;
+                    let destination = self.locator.new_value(ty.typeid, &mut self.slots);
+                    let op = Operation::PointerOffset(destination, base_ptr, index_value);
+                    self.push(op);
+                    Ok(OpOutput::Scalar(destination))
+                } else {
+                    todo!()
+                }
+            }
             TypedNode::Deref(ty, _, pos) => {
                 if tables.type_handler.is_scalar(&ty.typeid)? {
                     let source: Place = self.parse_place(node, tables)?;
@@ -708,15 +894,19 @@ impl Function {
                 self.push(op);
                 Ok(OpOutput::Scalar(slot_id))
             }
-            TypedNode::Assignment(ty, sym, child, _) => {
+            TypedNode::Cast(ty, node, pos) => {
+                let value = self.parse_value(*node, tables)?;
+                self.locator.drop(value);
+                let new_value = self.locator.new_value(ty, &mut self.slots);
+                let op = Operation::Cast(new_value, value);
+                self.push(op);
+                Ok(OpOutput::Scalar(new_value))
+            }
+            TypedNode::Assignment(ty, assignee, child, _) => {
                 let value = self.parse_value(*child, tables)?;
-                let slot_id = self.slots.lookup(&sym).unwrap().clone();
-                let place = Place {
-                    kind: PlaceKind::Slot(slot_id),
-                    offset: 0,
-                    typeid: ty.typeid,
-                };
-                self.push(Operation::Store(place.clone(), value));
+                let place = self.resolve_place(assignee, tables)?;
+                let op = Operation::Store(place.clone(), value);
+                self.push(op.clone());
                 self.locator.drop(value);
                 Ok(OpOutput::Memory(place))
             }
@@ -727,13 +917,21 @@ impl Function {
                     let value_id = self.parse_value(arg, tables)?;
                     ids.push(value_id);
                 }
-                let value = self.locator.new_value(ty, &mut self.slots);
-                let op = Operation::Call(value, id, ids);
-                self.push(op);
-                if ty == TypeID::NEVER {
-                    self.set_terminator(Terminator::Unreachable, pos)?;
+                let func = tables.func_table.get(&id);
+                let return_type = tables.type_handler.get(&func.ret, Some(pos))?;
+                if return_type.size > 0 {
+                    let value = self.locator.new_value(ty, &mut self.slots);
+                    let op = Operation::Call(Some(value), id, ids);
+                    self.push(op);
+                    Ok(OpOutput::Scalar(value))
+                } else {
+                    let op = Operation::Call(None, id, ids);
+                    self.push(op);
+                    if ty == TypeID::NEVER {
+                        self.set_terminator(Terminator::Unreachable)?;
+                    }
+                    Ok(OpOutput::Unit)
                 }
-                Ok(OpOutput::Scalar(value))
             }
         }
     }
@@ -774,13 +972,17 @@ impl Function {
                     let value_id = self.parse_value(arg, tables)?;
                     ids.push(value_id);
                 }
-                let op = Operation::Call(value, id, ids.clone());
-                for id in ids {
-                    self.locator.drop(id);
-                }
-                self.push(op);
-                if ty == TypeID::NEVER {
-                    self.set_terminator(Terminator::Unreachable, pos)?;
+                let func = tables.func_table.get(&id);
+                let return_type = tables.type_handler.get(&func.ret, Some(pos))?;
+                if return_type.size > 0 {
+                    let op = Operation::Call(Some(value), id, ids);
+                    self.push(op);
+                } else {
+                    let op = Operation::Call(None, id, ids);
+                    self.push(op);
+                    if ty == TypeID::NEVER {
+                        self.set_terminator(Terminator::Unreachable)?;
+                    }
                 }
             }
             TypedNode::Litteral(ty, litt, pos) => {
@@ -809,35 +1011,26 @@ impl Function {
                         format!("if_else"),
                         self.blocks.len() + 1,
                     );
-                    self.set_terminator(
-                        Terminator::Branch {
-                            predicate,
-                            destination: then_label.clone(),
-                            inverse: else_label.clone(),
-                        },
-                        pos,
-                    )?;
+                    self.set_terminator(Terminator::Branch {
+                        predicate,
+                        destination: then_label.clone(),
+                        inverse: else_label.clone(),
+                    })?;
                     self.locator.drop(predicate);
                     self.blocks.push(BasicBlock::new(then_label.clone()));
                     let then_res = self.parse_block_into(body.clone(), tables, value)?;
                     if let Terminator::Unknown = self.get_terminator() {
-                        self.set_terminator(
-                            Terminator::Jump {
-                                destination: merge_label.clone(),
-                            },
-                            body.position,
-                        )?;
+                        self.set_terminator(Terminator::Jump {
+                            destination: merge_label.clone(),
+                        })?;
                     }
 
                     self.blocks.push(BasicBlock::new(else_label.clone()));
                     let else_res = self.parse_block_into(else_body.clone(), tables, value)?;
                     if let Terminator::Unknown = self.get_terminator() {
-                        self.set_terminator(
-                            Terminator::Jump {
-                                destination: merge_label.clone(),
-                            },
-                            else_body.position,
-                        )?;
+                        self.set_terminator(Terminator::Jump {
+                            destination: merge_label.clone(),
+                        })?;
                     }
                     self.blocks.push(BasicBlock::new(merge_label));
                 }
@@ -857,7 +1050,7 @@ impl Function {
         block.operations.push(operation);
     }
 
-    pub fn set_terminator(&mut self, terminator: Terminator, pos: Position) -> ResResult<()> {
+    pub fn set_terminator(&mut self, terminator: Terminator) -> ResResult<()> {
         let block: &mut BasicBlock = self.blocks.last_mut().unwrap();
         match block.terminator {
             Terminator::Unknown => block.terminator = terminator,
@@ -913,6 +1106,23 @@ pub struct BasicBlock {
     pub terminator: Terminator,
 }
 
+impl BasicBlock {
+    pub fn nop_count(&self) -> usize {
+        self.operations
+            .iter()
+            .filter(|op| if let Operation::NOP = op { true } else { false })
+            .count()
+    }
+    pub fn remove_nop(&mut self) {
+        self.operations = self
+            .operations
+            .iter()
+            .filter(|op| if let Operation::NOP = op { false } else { true })
+            .map(|op| op.clone())
+            .collect();
+    }
+}
+
 impl Debug for BasicBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "{:?}:", self.label)?;
@@ -935,154 +1145,7 @@ impl BasicBlock {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum Operation {
-    AddressOf(ValueID, Place),
-    Load(ValueID, Place),
-    Store(Place, ValueID),
-    Move(ValueID, ValueID),
-    Deref(ValueID, ValueID),
-    Copy(Place, Place, TypeID),
-    Const(ValueID, Litteral),
-    ConstStr(ValueID, String),
-    Eq(TypeID, ValueID, ValueID, ValueID),
-    G(TypeID, ValueID, ValueID, ValueID),
-    L(TypeID, ValueID, ValueID, ValueID),
-    GEq(TypeID, ValueID, ValueID, ValueID),
-    LEq(TypeID, ValueID, ValueID, ValueID),
-    NEq(TypeID, ValueID, ValueID, ValueID),
-    Add(TypeID, ValueID, ValueID, ValueID),
-    Sub(TypeID, ValueID, ValueID, ValueID),
-    Div(TypeID, ValueID, ValueID, ValueID),
-    Mul(TypeID, ValueID, ValueID, ValueID),
-    Not(TypeID, ValueID, ValueID),
-    Neg(TypeID, ValueID, ValueID),
-    Call(ValueID, FuncID, Vec<ValueID>),
-}
-
-#[derive(Debug, Clone)]
-pub struct Place {
-    pub kind: PlaceKind,
-    pub offset: usize,
-    pub typeid: TypeID,
-}
-
-impl Place {
-    pub fn offset(&self, offset: usize, typeid: TypeID) -> Self {
-        Place {
-            kind: self.kind.clone(),
-            offset: self.offset + offset,
-            typeid,
-        }
-    }
-
-    pub fn is_pointer(&self) -> bool {
-        match self.kind {
-            PlaceKind::Slot(_) => false,
-            PlaceKind::Pointer(_) => true,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum PlaceKind {
-    Slot(SlotID),
-    Pointer(ValueID),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Eq, Ord, Hash)]
-pub struct SlotID(pub usize);
-
-impl SlotID {
-    pub const MAX: SlotID = SlotID(usize::MAX);
-}
-
-#[derive(Debug, Clone)]
-pub struct StackFrame {
-    pub stack_map: HashMap<SlotID, StackLocation>,
-    pub size: usize,
-}
-
-#[derive(Debug)]
-pub struct SlotTable {
-    slots: Vec<Slot>,
-    bindings: HashMap<SymbolID, SlotID>,
-    value_counter: usize,
-}
-
-impl SlotTable {
-    pub fn new() -> SlotTable {
-        SlotTable {
-            slots: Vec::new(),
-            value_counter: 0,
-            bindings: HashMap::new(),
-        }
-    }
-
-    pub fn new_var(&mut self, type_id: TypeID, symbol_id: SymbolID) -> SlotID {
-        let slot_id = SlotID(self.slots.len());
-        self.slots.push(Slot { ty: type_id });
-        self.bindings.insert(symbol_id, slot_id);
-        slot_id
-    }
-
-    pub fn new_temp(&mut self, type_id: TypeID) -> SlotID {
-        let slot_id = SlotID(self.slots.len());
-        self.slots.push(Slot { ty: type_id });
-        slot_id
-    }
-
-    pub fn get(&self, id: SlotID) -> &Slot {
-        &self.slots[id.0]
-    }
-    pub fn lookup(&self, id: &SymbolID) -> Option<&SlotID> {
-        self.bindings.get(id)
-    }
-
-    pub fn stack_frame(&self, type_handler: &TypeHandler) -> StackFrame {
-        let mut map = HashMap::new();
-        let mut used = 0;
-        for (i, slot) in self.slots.iter().enumerate() {
-            if slot.ty == TypeID::VOID {
-                continue;
-            }
-            let ty = type_handler.get(&slot.ty, None).unwrap();
-            let alignment = ty.size;
-            if alignment == 0 {
-                continue;
-            }
-            used = align_up(used, alignment);
-
-            used += ty.size;
-            let location = StackLocation {
-                offset: used,
-                size: ty.size,
-                pointer: false,
-            };
-            map.insert(SlotID(i), location);
-        }
-        used += 16 - (used % 16);
-        StackFrame {
-            stack_map: map,
-            size: used,
-        }
-    }
-}
-
-pub fn align_up(value: usize, alignment: usize) -> usize {
-    (value + alignment - 1) & !(alignment - 1)
-}
-
-#[derive(Debug)]
-pub struct Slot {
-    pub ty: TypeID,
-    //pub alignment: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Eq, Ord)]
-pub struct ValueID(pub usize);
-
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct BlockLabel(String, String, usize);
 
 impl BlockLabel {
@@ -1093,6 +1156,16 @@ impl BlockLabel {
     pub fn ident(&self) -> &String {
         &self.0
     }
+}
+
+fn values_to_string(mut v: Vec<ValueID>) -> String {
+    let mut out = String::new();
+    let last = v.pop().unwrap();
+    for id in v {
+        out.push_str(format!("{}, ", id).as_str());
+    }
+    out.push_str(format!("{}", last).as_str());
+    out
 }
 
 impl Debug for BlockLabel {

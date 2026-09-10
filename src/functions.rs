@@ -33,6 +33,16 @@ impl FuncTable {
             params: vec![TypeID::U64],
             ret: TypeID::NEVER,
         });
+        functions.push(FuncSignature {
+            identifier: "crust_mmap".to_owned(),
+            params: vec![TypeID::USIZE],
+            ret: ref_u8,
+        });
+        functions.push(FuncSignature {
+            identifier: "crust_munmap".to_owned(),
+            params: vec![ref_u8, TypeID::USIZE],
+            ret: TypeID::VOID,
+        });
         Self {
             functions,
             current: None,

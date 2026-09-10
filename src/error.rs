@@ -3,7 +3,7 @@ use std::{collections::{HashMap, hash_map::Keys}, fmt::Debug, hash::Hash, io::Wr
 use colored::Colorize;
 
 use crate::{
-    functions::FuncID, lexer::{Position, Token, TokenType}, parser::Node, ssa::SlotID, symbols::{Symbol, SymbolID}, types::{LoopContext, TypeHandler, TypeID, TypedNode, TypedStatement}
+    asm::Register, functions::FuncID, lexer::{Position, Token, TokenType}, locations::RegisterSet, parser::Node, ssa::SlotID, symbols::{Symbol, SymbolID}, types::{LoopContext, TypeHandler, TypeID, TypedNode, TypedStatement}
 };
 
 pub type ResResult<T> = Result<T, ResError>;
@@ -143,6 +143,9 @@ pub enum ResErrorKind {
     ControlFlowExited,
     Unreachable,
     ExpectedReturnValue(TypeID),
+    ExpectedNonArray(TypeID),
+    ExpectedArray(TypeID),
+    ExpectedSeparator(Token),
 }
 
 impl ResErrorKind {
@@ -162,6 +165,14 @@ impl ResErrorKind {
                 "expected type {}, got {}",
                 th.get(exp, pos)?.identifier.blue(),
                 th.get(got, pos)?.identifier.blue()
+            ),
+            Self::ExpectedNonArray(exp) => format!(
+                "expected type {}, got array constructor",
+                th.get(exp, pos)?.identifier.blue(),
+            ),
+            Self::ExpectedArray(exp) => format!(
+                "expected array, got {}",
+                th.get(exp, pos)?.identifier.blue(),
             ),
             Self::CantDeref(ty) => format!("cannot dereference type {}", th.get(ty, pos)?.identifier.blue()),
             Self::FieldNotFound(field, ty) => {
@@ -289,6 +300,15 @@ impl Debug for ResErrorKind {
             },
             Self::ExpectedReturnValue(_) => {
                 write!(f, "expected return value")
+            },
+            Self::ExpectedNonArray(_) => {
+                write!(f, "expected non array type, got array constructor")
+            },
+            Self::ExpectedArray(_) => {
+                write!(f, "expected array type")
+            },
+            Self::ExpectedSeparator(got) => {
+                write!(f, "expected separator, got {}", got)
             }
         }
     }
@@ -366,6 +386,10 @@ impl<K: Eq + Hash + Clone + Debug> Setter<K> {
         None
     }
 
+    pub fn use_key(&mut self, key: &K) {
+        *self.used.get_mut(key).unwrap() = true;
+    }
+
     pub fn drop(&mut self, key: &K) {
         if let Some(used) = self.used.get_mut(key) {
             *used = false;
@@ -379,5 +403,11 @@ impl<K: Eq + Hash + Clone + Debug> Setter<K> {
     pub fn is_used(&self, key: &K) -> bool {
         self.used[key]
     }
+
 }
 
+impl Setter<Register> {
+    pub fn to_set(&self) -> RegisterSet {
+        RegisterSet::from(self.used.iter().filter(|(_, v)| !**v).map(|(k, _)| k).collect::<Vec<_>>())
+    }
+}

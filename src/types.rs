@@ -5,6 +5,7 @@ use crate::{
     functions::{FuncID, FuncSignature, FuncTable},
     lexer::Position,
     parser::{BinaryOperator, Block, Litteral, Node, Statement, TypeSyntax, UnaryOperator},
+    ssa::{Place, PlaceKind, SlotTable},
     structs::{FieldID, StructID, StructTable},
     symbols::{Binding, ScopeTable, Symbol, SymbolID, SymbolTable},
 };
@@ -25,9 +26,11 @@ impl TypeID {
     pub const BOOL: TypeID = TypeID(9);
     pub const STR: TypeID = TypeID(10);
     pub const NEVER: TypeID = TypeID(11);
+    pub const USIZE: TypeID = TypeID(12);
+    pub const ISIZE: TypeID = TypeID(13);
 
     pub fn numerical(&self) -> bool {
-        self.0 >= 1 && self.0 <= 8
+        (self.0 >= 1 && self.0 <= 8) || self.0 == 12 || self.0 == 13
     }
 
     pub fn strong(self) -> InferedType {
@@ -77,6 +80,13 @@ impl Type {
                     pointee: Box::new(ty.syntax(th)?),
                 })
             }
+            TypeKind::Array(element, length) => {
+                let ty = th.get(&element, None)?;
+                Ok(TypeSyntax::Array {
+                    length,
+                    element: Box::new(ty.syntax(th)?),
+                })
+            }
         }
     }
 }
@@ -86,6 +96,7 @@ pub enum TypeKind {
     Primitive,
     Structure(StructID),
     Reference(TypeID),
+    Array(TypeID, usize),
 }
 
 impl Display for Type {
@@ -169,24 +180,28 @@ impl TypeHandler {
             size: 0,
             kind: TypeKind::Primitive,
         });
+        handler.define(Type {
+            identifier: String::from("usize"),
+            size: 8,
+            kind: TypeKind::Primitive,
+        });
+        handler.define(Type {
+            identifier: String::from("isize"),
+            size: 8,
+            kind: TypeKind::Primitive,
+        });
         handler
     }
 
     pub fn inner_struct(&self, id: &TypeID, pos: Position) -> ResResult<StructID> {
         let base_type = self.get(id, Some(pos))?;
         match base_type.kind {
-            TypeKind::Structure(struct_id) => {
-                Ok(struct_id)
-            },
-            TypeKind::Reference(type_id) => {
-                self.inner_struct(&type_id, pos)
-            }
+            TypeKind::Structure(struct_id) => Ok(struct_id),
+            TypeKind::Reference(type_id) => self.inner_struct(&type_id, pos),
             TypeKind::Primitive => {
-                return Err(ResError::new_err(
-                    ResErrorKind::ExpectedStruct,
-                    pos,
-                ));
+                return Err(ResError::new_err(ResErrorKind::ExpectedStruct, pos));
             }
+            TypeKind::Array(type_id, _) => self.inner_struct(&type_id, pos),
         }
     }
 
@@ -226,26 +241,41 @@ impl TypeHandler {
         if let Some(id) = self.bindings.get(&identifier) {
             Some(id.clone())
         } else {
-            if let TypeSyntax::Reference { mutable, pointee } = identifier {
-                let pointee_id = self.lookup_or_define(*pointee.clone()).unwrap().clone();
-                let ref_id = TypeID(self.types.len());
-                let pointee_type = self.get(&pointee_id, None).unwrap();
-                let ref_type = Type {
-                    identifier: format!("&{}", pointee_type.identifier),
-                    size: 8,
-                    kind: TypeKind::Reference(pointee_id),
-                };
-                self.types.insert(ref_id, ref_type);
-                self.bindings.insert(
-                    TypeSyntax::Reference {
-                        mutable: false,
-                        pointee,
-                    },
-                    ref_id,
-                );
-                Some(ref_id)
-            } else {
-                None
+            match identifier {
+                TypeSyntax::Reference { mutable, pointee } => {
+                    let pointee_id = self.lookup_or_define(*pointee.clone()).unwrap().clone();
+                    let ref_id = TypeID(self.types.len());
+                    let pointee_type = self.get(&pointee_id, None).unwrap();
+                    let ref_type = Type {
+                        identifier: format!("&{}", pointee_type.identifier),
+                        size: 8,
+                        kind: TypeKind::Reference(pointee_id),
+                    };
+                    self.types.insert(ref_id, ref_type);
+                    self.bindings.insert(
+                        TypeSyntax::Reference {
+                            mutable: false,
+                            pointee,
+                        },
+                        ref_id,
+                    );
+                    Some(ref_id)
+                }
+                TypeSyntax::Array { element, length } => {
+                    let element_id = self.lookup_or_define(*element.clone()).unwrap().clone();
+                    let array_id = TypeID(self.types.len());
+                    let element_type = self.get(&element_id, None).unwrap();
+                    let array_type = Type {
+                        identifier: format!("[{}; {}]", element_type.identifier, length),
+                        size: element_type.size * length,
+                        kind: TypeKind::Array(element_id, length),
+                    };
+                    self.types.insert(array_id, array_type);
+                    self.bindings
+                        .insert(TypeSyntax::Array { element, length }, array_id);
+                    Some(array_id)
+                }
+                _ => None,
             }
         }
     }
@@ -347,6 +377,31 @@ impl TypedBlock {
 }
 
 #[derive(Clone, Debug)]
+pub enum Assignee {
+    Symbol(SymbolID),
+    Field {
+        base: Box<Assignee>,
+        field: FieldID,
+    },
+    Index {
+        base: Box<Assignee>,
+        index: Box<TypedNode>,
+    },
+    Deref(SymbolID),
+}
+
+impl Assignee {
+    pub fn get_base_symbol(&self) -> SymbolID {
+        match self {
+            Assignee::Symbol(s) => s.clone(),
+            Assignee::Deref(s) => s.clone(),
+            Assignee::Index { base, index: _ } => base.get_base_symbol(),
+            Assignee::Field { base, field: _ } => base.get_base_symbol(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum TypedNode {
     Binary {
         typeid: InferedType,
@@ -360,10 +415,11 @@ pub enum TypedNode {
     Litteral(InferedType, Litteral, Position),
     Identifier(InferedType, SymbolID, Position),
     FieldAccess(InferedType, Box<TypedNode>, FieldID, Position),
+    Index(InferedType, Box<TypedNode>, Box<TypedNode>, Position),
     Address(InferedType, bool, Box<TypedNode>, Position),
     Deref(InferedType, Box<TypedNode>, Position),
     FuncIdentifier(TypeID, FuncID, Vec<TypedNode>, Position),
-    Assignment(InferedType, SymbolID, Box<TypedNode>, Position),
+    Assignment(InferedType, Assignee, Box<TypedNode>, Position),
     Block(InferedType, TypedBlock),
     Loop(InferedType, TypedBlock),
     If(
@@ -373,7 +429,9 @@ pub enum TypedNode {
         Option<TypedBlock>,
         Position,
     ),
-    Constructor(TypeID, Vec<(FieldID, TypedNode)>, Position),
+    Cast(TypeID, Box<TypedNode>, Position),
+    StructConstructor(TypeID, Vec<(FieldID, TypedNode)>, Position),
+    ArrayConstructor(TypeID, Vec<TypedNode>, Position),
 }
 
 impl TypedNode {
@@ -395,11 +453,29 @@ impl TypedNode {
             Self::FuncIdentifier(t, _, _, _) => t.strong(),
             Self::Block(t, _) => t,
             Self::Loop(t, _) => t,
-            Self::Constructor(t, _, _) => t.strong(),
+            Self::StructConstructor(t, _, _) => t.strong(),
+            Self::ArrayConstructor(t, _, _) => t.strong(),
             Self::FieldAccess(t, _, _, _) => t,
+            Self::Index(t, _, _, _) => t,
             Self::Address(t, _, _, _) => t,
             Self::Deref(t, _, _) => t,
+            Self::Cast(t, _, _) => t.strong(),
             _ => todo!(),
+        }
+    }
+    pub fn equal_const(&self, other: &TypedNode) -> bool {
+        match (self, other) {
+            (TypedNode::Litteral(ty1, litt1, _), TypedNode::Litteral(ty2, litt2, _)) => {
+                ty1.typeid == ty2.typeid && litt1 == litt2
+            }
+            _ => false,
+        }
+    }
+    pub fn unwrap_const(&self) -> Litteral {
+        if let Self::Litteral(_, litt, _) = self {
+            litt.clone()
+        } else {
+            unreachable!()
         }
     }
     pub fn child_stmts(&self) -> Vec<&TypedStatement> {
@@ -437,6 +513,7 @@ impl TypedNode {
             Self::Parenthesis(_, child) => child.position(),
             Self::Identifier(_, _, pos) => pos.clone(),
             Self::FieldAccess(_, _, _, pos) => pos.clone(),
+            Self::Index(_, _, _, pos) => pos.clone(),
             Self::Address(_, _, _, pos) => pos.clone(),
             Self::Deref(_, _, pos) => pos.clone(),
             Self::FuncIdentifier(_, _, _, pos) => pos.clone(),
@@ -444,7 +521,9 @@ impl TypedNode {
             Self::Block(_, block) => block.position.clone(),
             Self::Loop(_, block) => block.position.clone(),
             Self::If(_, _, _, _, pos) => pos.clone(),
-            Self::Constructor(_, _, pos) => pos.clone(),
+            Self::StructConstructor(_, _, pos) => pos.clone(),
+            Self::ArrayConstructor(_, _, pos) => pos.clone(),
+            Self::Cast(_, _, pos) => pos.clone(),
         }
     }
 
@@ -485,6 +564,7 @@ pub struct InferedType {
 impl InferedType {
     pub fn assert(&self, pos: Position) -> ResResult<()> {
         if !self.strong && self.typeid == TypeID::VOID {
+            println!("{:#?}", self);
             Err(ResError::new_err(ResErrorKind::NotInferableNode, pos))
         } else {
             Ok(())
@@ -674,7 +754,7 @@ impl Typer {
                 }
             }
             Statement::Expression(node) => {
-                let child = self.resolve_node(node, type_handler, &TypeID::VOID.weak())?;
+                let child = self.resolve_node(node, type_handler, &TypeID::VOID.strong())?;
                 Ok(TypedStatement::Expression(child.infered_type(), child))
             }
             Statement::While(pre, body) => {
@@ -687,7 +767,6 @@ impl Typer {
             _ => todo!(),
         }
     }
-
     pub fn resolve_block(
         &mut self,
         block: Block,
@@ -742,6 +821,58 @@ impl Typer {
                     pos,
                 )
             }
+            Node::ArrayConstructor(nodes, pos) => {
+                if expected.strong {
+                    let ty = type_handler.get(&expected.typeid, Some(pos))?;
+                    if let TypeKind::Array(element_type, length) = ty.kind {
+                        let mut typed_nodes = Vec::new();
+                        for node in nodes {
+                            let typed_node =
+                                self.resolve_node(node, type_handler, &element_type.strong())?;
+                            typed_nodes.push(typed_node);
+                        }
+                        TypedNode::ArrayConstructor(expected.typeid, typed_nodes, pos)
+                    } else {
+                        return Err(ResError::new_err(
+                            ResErrorKind::ExpectedNonArray(expected.typeid),
+                            pos,
+                        ));
+                    }
+                } else {
+                    let length = nodes.len();
+                    let mut iterator = nodes.into_iter();
+                    let first = self.resolve_node(
+                        iterator.next().unwrap(),
+                        type_handler,
+                        &TypeID::VOID.weak(),
+                    )?;
+                    let expected_type = first.infered_type();
+                    let mut typed_nodes = vec![first];
+                    for node in iterator {
+                        let typed_node = self.resolve_node(node, type_handler, &expected_type)?;
+                        typed_nodes.push(typed_node);
+                    }
+                    let element_type = type_handler.get(&expected_type.typeid, Some(pos))?;
+                    let array_type = type_handler
+                        .lookup_or_define(TypeSyntax::Array {
+                            element: Box::new(element_type.syntax(type_handler)?),
+                            length,
+                        })
+                        .unwrap();
+                    TypedNode::ArrayConstructor(array_type, typed_nodes, pos)
+                }
+            }
+            Node::Cast(node, new_ty, pos) => {
+                let typed_node = self.resolve_node(*node, type_handler, &TypeID::VOID.weak())?;
+                let old_ty = type_handler.get(&typed_node.infered_type().typeid, Some(pos))?;
+                let new_ty_id = type_handler.lookup(new_ty).unwrap();
+                let new_ty = type_handler.get(&new_ty_id, Some(pos))?;
+                if typed_node.infered_type().typeid != new_ty_id {
+                    TypedNode::Cast(new_ty_id, Box::new(typed_node), pos)
+                } else {
+                    typed_node
+                }
+            }
             Node::Block(block) => {
                 self.scopes.push_scope();
                 let typed_block = self.resolve_block(block, type_handler, expected)?;
@@ -769,7 +900,7 @@ impl Typer {
 
                     TypedNode::If(t, Box::new(pre), body, Some(el), pos)
                 } else {
-                    TypedNode::If(body.infered_type(), Box::new(pre), body, None, pos)
+                    TypedNode::If(TypeID::VOID.strong(), Box::new(pre), body, None, pos)
                 }
             }
             Node::FieldAccess(base, field, pos) => {
@@ -779,6 +910,26 @@ impl Typer {
                 let field_id = struc.lookup(&field, Some(pos)).unwrap();
                 let field_type = struc.get_type(field_id);
                 TypedNode::FieldAccess(field_type.strong(), Box::new(typed_base), field_id, pos)
+            }
+            Node::Index(base, index, pos) => {
+                let typed_base = self.resolve_node(*base, type_handler, &TypeID::VOID.weak())?;
+                let typed_index =
+                    self.resolve_node(*index, type_handler, &TypeID::USIZE.strong())?;
+                let array_type = type_handler.get(&typed_base.infered_type().typeid, Some(pos))?;
+                match array_type.kind {
+                    TypeKind::Array(element_id, length) => TypedNode::Index(
+                        element_id.strong(),
+                        Box::new(typed_base),
+                        Box::new(typed_index),
+                        pos,
+                    ),
+                    _ => {
+                        return Err(ResError::new_err(
+                            ResErrorKind::ExpectedArray(typed_base.infered_type().typeid),
+                            pos,
+                        ));
+                    }
+                }
             }
             Node::Address(mutable, node, pos) => {
                 let typed_node = self.resolve_node(*node, type_handler, &TypeID::VOID.weak())?;
@@ -821,7 +972,7 @@ impl Typer {
                     }
                 }
             }
-            Node::Constructor(type_ident, fields, pos) => {
+            Node::StructConstructor(type_ident, fields, pos) => {
                 let type_id = type_handler
                     .lookup(TypeSyntax::Raw(type_ident.clone()))
                     .unwrap();
@@ -837,7 +988,7 @@ impl Typer {
                             self.resolve_node(node, type_handler, &field_type.strong())?;
                         typed_fields.push((field_id, typed_node));
                     }
-                    TypedNode::Constructor(type_id, typed_fields, pos)
+                    TypedNode::StructConstructor(type_id, typed_fields, pos)
                 } else {
                     return Err(ResError::new_err(
                         ResErrorKind::UnknownType(type_ident),
@@ -846,50 +997,11 @@ impl Typer {
                 }
             }
             Node::Assignment(node, child, pos) => {
-                let ident = match *node {
-                    Node::Identifier(ident, _) => ident,
-                    Node::FieldAccess(_, _, _) => todo!(),
-                    _ => unreachable!(),
-                };
-                let binding = self.scopes.lookup(ident.clone()).ok_or(ResError::new_err(
-                    ResErrorKind::UnknownVariable(ident.clone()),
-                    pos,
-                ))?;
-                match binding {
-                    Binding::Variable(id) => {
-                        let symbol: Symbol = self.symbols.get(&id).clone();
-                        if !symbol.mutable {
-                            return Err(ResError::new_err(
-                                ResErrorKind::CantAssignImmutable(symbol),
-                                pos,
-                            ));
-                        }
-                        let node = self.resolve_node(*child, type_handler, &symbol.typeid)?;
+                let child = self.resolve_node(*child, type_handler, &TypeID::VOID.weak())?;
+                let assignee =
+                    self.resolve_assignee(*node, pos, child.infered_type(), type_handler)?;
 
-                        let symbol: &mut Symbol = self.symbols.get_mut(id);
-
-                        if !symbol.typeid.strong && node.infered_type().strong {
-                            symbol.typeid = node.infered_type();
-                        }
-                        if symbol.typeid.typeid != node.infered_type().typeid {
-                            return Err(ResError::new_err(
-                                ResErrorKind::TypeMismatch(
-                                    symbol.typeid.typeid,
-                                    node.infered_type().typeid,
-                                ),
-                                pos,
-                            ));
-                        } else {
-                            TypedNode::Assignment(symbol.typeid.clone(), id, Box::new(node), pos)
-                        }
-                    }
-                    Binding::Function(id) => {
-                        return Err(ResError::new_err(
-                            ResErrorKind::ExpectedVariable(ident, id),
-                            pos,
-                        ));
-                    }
-                }
+                TypedNode::Assignment(TypeID::VOID.strong(), assignee, Box::new(child), pos)
             }
             Node::Identifier(ident, pos) => {
                 let binding = self.scopes.lookup(ident.clone()).ok_or(ResError::new_err(
@@ -1003,6 +1115,7 @@ impl Typer {
                         (true, false) => self.correct_node(&mut inner_right, &type_left.typeid)?,
                         (false, true) => self.correct_node(&mut inner_left, &type_right.typeid)?,
                         (false, false) => {
+                            println!("left: {:?}, right: {:?}", inner_left, inner_right);
                             return Err(ResError::new_err(
                                 ResErrorKind::NoTypeInfo(type_left.typeid, type_right.typeid),
                                 position,
@@ -1016,7 +1129,7 @@ impl Typer {
                     if !expected.strong && expected.typeid == TypeID::VOID {
                         type_left
                     } else {
-                        expected.clone()
+                        expected.clone().typeid.strong()
                     }
                 };
                 TypedNode::Binary {
@@ -1029,6 +1142,62 @@ impl Typer {
             }
         };
         Ok(node)
+    }
+
+    pub fn resolve_assignee(
+        &mut self,
+        node: Node,
+        pos: Position,
+        expected: InferedType,
+        type_handler: &mut TypeHandler,
+    ) -> ResResult<Assignee> {
+        match node {
+            Node::Identifier(ident, _) => {
+                let binding = self.scopes.lookup(ident.clone()).ok_or(ResError::new_err(
+                    ResErrorKind::UnknownVariable(ident.clone()),
+                    pos,
+                ))?;
+                match binding {
+                    Binding::Variable(id) => {
+                        let symbol: &mut Symbol = self.symbols.get_mut(id);
+                        if !symbol.mutable {
+                            return Err(ResError::new_err(
+                                ResErrorKind::CantAssignImmutable(symbol.clone()),
+                                pos,
+                            ));
+                        }
+                        if !symbol.typeid.strong && expected.strong {
+                            symbol.typeid = expected;
+                        }
+                        if symbol.typeid.typeid != expected.typeid && expected.strong {
+                            return Err(ResError::new_err(
+                                ResErrorKind::TypeMismatch(symbol.typeid.typeid, expected.typeid),
+                                pos,
+                            ));
+                        }
+                        Ok(Assignee::Symbol(id))
+                    }
+                    Binding::Function(id) => {
+                        return Err(ResError::new_err(
+                            ResErrorKind::ExpectedVariable(ident, id),
+                            pos,
+                        ));
+                    }
+                }
+            }
+            Node::FieldAccess(_, _, _) => todo!(),
+            Node::Index(base, index, _) => {
+                let parent =
+                    self.resolve_assignee(*base, pos, TypeID::VOID.weak(), type_handler)?;
+                let typed_index =
+                    self.resolve_node(*index, type_handler, &TypeID::USIZE.strong())?;
+                Ok(Assignee::Index {
+                    base: Box::new(parent),
+                    index: Box::new(typed_index),
+                })
+            }
+            _ => unreachable!(),
+        }
     }
 
     pub fn correct_stmt(&mut self, mut stmt: &mut TypedStatement) -> ResResult<()> {
@@ -1070,8 +1239,11 @@ impl Typer {
                 t.strong = true;
                 t.typeid = *expected;
             }
-            TypedNode::Constructor(_, _, _) => {}
+            TypedNode::StructConstructor(_, _, _) => {}
+            TypedNode::ArrayConstructor(_, _, _) => {}
+            TypedNode::Cast(_, _, _) => {}
             TypedNode::FieldAccess(_, _, _, _) => {}
+            TypedNode::Index(_, _, _, _) => {}
             TypedNode::Address(_, _, _, _) => {}
             TypedNode::Deref(_, _, _) => {}
             TypedNode::Litteral(t, _, pos) => {
@@ -1279,162 +1451,6 @@ impl Typer {
             struct_table: self.structs,
             file_contents,
         }
-    }
-
-    fn strong_stmt(&self, stmt: &TypedStatement) -> ResResult<()> {
-        match stmt {
-            TypedStatement::Return(t, Some(child)) => {
-                self.strong_node(child)?;
-                if !t.strong {
-                    return Err(ResError::new_err(
-                        ResErrorKind::NotInferableStmt,
-                        child.position(),
-                    ));
-                }
-            }
-            TypedStatement::Return(t, None) => {
-                if !t.strong {
-                    return Err(ResError::new_err(
-                        ResErrorKind::NotInferableStmt,
-                        Position::new(0, 0, 0, 0),
-                    ));
-                }
-            }
-            TypedStatement::Expression(t, node) => {
-                self.strong_node(node)?;
-                if !t.strong {
-                    return Err(ResError::new_err(
-                        ResErrorKind::NotInferableStmt,
-                        node.position(),
-                    ));
-                }
-            }
-            TypedStatement::VarDecl(_, _, node) => self.strong_node(node)?,
-            TypedStatement::Exit(t, n) => {
-                self.strong_node(n)?;
-                if !t.strong {
-                    return Err(ResError::new_err(
-                        ResErrorKind::NotInferableStmt,
-                        n.position(),
-                    ));
-                }
-            }
-            _ => todo!(),
-        }
-        Ok(())
-    }
-
-    fn strong_block(&self, block: &TypedBlock) -> ResResult<()> {
-        for stmt in &block.stmts {
-            self.strong_stmt(stmt);
-        }
-        if let Some(tail) = &block.tail {
-            self.strong_node(tail);
-        }
-        Ok(())
-    }
-
-    fn strong_node(&self, node: &TypedNode) -> ResResult<()> {
-        match node {
-            TypedNode::Constructor(_, _, _) => todo!(),
-            TypedNode::FieldAccess(_, _, _, _) => todo!(),
-            TypedNode::Address(_, _, _, _) => todo!(),
-            TypedNode::Deref(_, _, _) => todo!(),
-            TypedNode::Unary(t, _, n, pos) => {
-                self.strong_node(n)?;
-                if !t.strong {
-                    return Err(ResError::new_warn(
-                        ResErrorKind::NotInferableNode,
-                        pos.clone(),
-                    ));
-                }
-            }
-            TypedNode::Binary {
-                typeid,
-                left,
-                right,
-                operator,
-                position,
-            } => {
-                self.strong_node(left)?;
-                self.strong_node(right)?;
-                if !typeid.strong {
-                    return Err(ResError::new_warn(
-                        ResErrorKind::NotInferableNode,
-                        position.clone(),
-                    ));
-                }
-            }
-            TypedNode::Litteral(t, _, pos) => {
-                if !t.strong {
-                    return Err(ResError::new_warn(
-                        ResErrorKind::NotInferableNode,
-                        pos.clone(),
-                    ));
-                }
-            }
-            TypedNode::Block(_, block) => {
-                for stmt in &block.stmts {
-                    self.strong_stmt(stmt)?;
-                }
-                if let Some(tail) = &block.tail {
-                    self.strong_node(tail)?
-                }
-            }
-            TypedNode::Loop(_, block) => {
-                for stmt in &block.stmts {
-                    self.strong_stmt(stmt)?;
-                }
-                if let Some(tail) = &block.tail {
-                    self.strong_node(tail)?
-                }
-            }
-            TypedNode::If(t, n, stmt, opt_stmt, pos) => {
-                self.strong_node(n)?;
-                self.strong_block(stmt)?;
-                if let Some(stmt2) = opt_stmt {
-                    self.strong_block(stmt2)?;
-                }
-                if !t.strong {
-                    return Err(ResError::new_err(
-                        ResErrorKind::NotInferableStmt,
-                        pos.clone(),
-                    ));
-                }
-            }
-            TypedNode::Identifier(t, _, pos) => {
-                if !t.strong {
-                    return Err(ResError::new_warn(
-                        ResErrorKind::NotInferableNode,
-                        pos.clone(),
-                    ));
-                }
-            }
-            TypedNode::Assignment(t, _, n, pos) => {
-                self.strong_node(n)?;
-                if !t.strong {
-                    return Err(ResError::new_warn(
-                        ResErrorKind::NotInferableNode,
-                        pos.clone(),
-                    ));
-                }
-            }
-            TypedNode::Parenthesis(t, n) => {
-                self.strong_node(n)?;
-                if !t.strong {
-                    return Err(ResError::new_warn(
-                        ResErrorKind::NotInferableNode,
-                        n.position(),
-                    ));
-                }
-            }
-            TypedNode::FuncIdentifier(_, _, nodes, _) => {
-                for node in nodes {
-                    self.strong_node(node)?;
-                }
-            }
-        }
-        Ok(())
     }
 
     pub fn optimize_stmts(&mut self, stmts: &mut Vec<TypedStatement>) {

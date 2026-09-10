@@ -48,6 +48,9 @@ pub enum TokenType {
     RightParen,
     LeftBrace,
     RightBrace,
+    LeftBlock,
+    RightBlock,
+    As,
     Star,
     Dot,
     Comma,
@@ -61,6 +64,7 @@ pub enum TokenType {
     Greater,
     Less,
     Carrot,
+    Percent,
 
     Arrow,
 
@@ -194,6 +198,15 @@ pub fn scan(str: String) -> anyhow::Result<Vec<Token>> {
                     i += 1;
                 }
             },
+            'a' if stream[i + 1] == 's' && stream[i + 2].is_whitespace() => {
+                let token = Token {
+                    token_type: TokenType::As,
+                    raw: format!("as"),
+                    position: Position::new(line_number, i, line_number, i + 1),
+                };
+                out.push(token);
+                i += 1;
+            }
             '-' if stream[i + 1] == '>' => {
                 let token = Token {
                     token_type: TokenType::Arrow,
@@ -284,7 +297,10 @@ impl Display for Token {
             RightParen => "RIGHT_PAREN",
             LeftBrace => "LEFT_BRACE",
             RightBrace => "RIGHT_BRACE",
+            LeftBlock => "LEFT_BLOCK",
+            RightBlock => "RIGHT_BLOCK",
             Star => "STAR",
+            Percent => "PERCENT",
             Dot => "DOT",
             Comma => "COMMA",
             Plus => "PLUS",
@@ -300,6 +316,7 @@ impl Display for Token {
             Carrot => "CARROT",
 
             Arrow => "ARROW",
+            As => "AS",
 
             If => "IF",
             Reference => "REFERENCE",
@@ -342,11 +359,14 @@ impl From<char> for TokenType {
             ')' => RightParen,
             '{' => LeftBrace,
             '}' => RightBrace,
+            '[' => LeftBlock,
+            ']' => RightBlock,
             '*' => Star,
             '.' => Dot,
             ',' => Comma,
             '+' => Plus,
             '-' => Minus,
+            '%' => Percent,
             '/' => Slash,
             ';' => SemiColon,
             ':' => Colon,

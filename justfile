@@ -1,5 +1,5 @@
 build:
-    cargo run -- compile ./src/examples/test.crs
+    cargo run -- compile
 
 assemble:
     gcc -no-pie -g ./test.s ./runtime.s -o test

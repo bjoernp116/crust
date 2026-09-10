@@ -1,0 +1,3 @@
+name = "test"
+
+include = ["./src/examples/test.crs", "./src/examples/std.crs"]

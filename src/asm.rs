@@ -1,15 +1,17 @@
+use std::collections::HashMap;
+
 use crate::{
     error::{ResError, ResErrorKind, ResResult, Severity},
     functions::{self, FuncID, FuncSignature},
     lexer::Position,
-    locations::{Locator, StackLocation, ValueLocation},
+    locations::{Locator, RegisterSet, StackLocation, Value, ValueLocation},
     parser::Litteral,
     ssa::{
         BasicBlock, Function, Operation, Place, PlaceKind, SSA, SlotID, SlotTable, StackFrame,
         Terminator, ValueID,
     },
     symbols::SymbolID,
-    types::{Tables, TypeID},
+    types::{Tables, TypeID, TypeKind},
 };
 pub struct AsmWriter {
     tables: Tables,
@@ -56,6 +58,7 @@ impl AsmWriter {
         args: &Vec<SymbolID>,
         locator: &Locator,
     ) {
+        println!("{:?}", block.label);
         let frame = slots.stack_frame(&self.tables.type_handler);
         if block.label.entry() {
             self.buffer
@@ -64,7 +67,7 @@ impl AsmWriter {
             self.buffer.push_str(&format!(".L{:?}:\n", block.label));
             self.push("push rbp");
             self.push("mov rbp, rsp");
-            self.push(format!("sub rsp, {}\n", frame.size));
+            self.push(format!("sub rsp, {:#x}\n", frame.size));
 
             for (i, sym) in args.iter().enumerate() {
                 let reg = &ARG_REGISTERS[i];
@@ -72,12 +75,19 @@ impl AsmWriter {
                     let value = locator.get(id);
                     let ty = self.tables.type_handler.get(&value.typeid, None).unwrap();
                     match value.location {
-                        ValueLocation::Spill(_) => todo!(),
+                        ValueLocation::Spill(slot) => self.push(format!(
+                            "mov {}, {}",
+                            locator.display(id, &self.tables.type_handler, &frame),
+                            reg.with_size(ty.size)
+                        )),
                         ValueLocation::Register(src) => {
                             self.push(Self::move_reg(&src, reg, ty.size));
-                            continue;
+                        }
+                        ValueLocation::Unallocated => {
+                            panic!("value is Unallocated");
                         }
                     }
+                    continue;
                 }
                 if let Some(id) = slots.lookup(sym) {
                     let typeid = &slots.get(id.clone()).ty;
@@ -86,7 +96,7 @@ impl AsmWriter {
                     self.store(reg, todo!(), ty.size, slots, locator);
                     continue;
                 }
-                panic!("Symbol Not Defined!");
+                panic!("Symbol {:?} Not Defined!", sym);
             }
         } else {
             self.buffer.push_str(&format!(".L{:?}:\n", block.label));
@@ -110,11 +120,13 @@ impl AsmWriter {
                 if let Some(value) = value {
                     let l = locator.get(&value);
                     let ty = self.tables.type_handler.get(&l.typeid, None).unwrap();
-                    self.push(format!(
-                        "mov {}, {}",
-                        Register::A.with_size(ty.size),
-                        locator.display(&value, &self.tables.type_handler, frame)
-                    ));
+                    if ty.size != 0 {
+                        self.push(format!(
+                            "mov {}, {}",
+                            Register::A.with_size(ty.size),
+                            locator.display(&value, &self.tables.type_handler, frame)
+                        ));
+                    }
                 }
                 self.push("mov rsp, rbp");
                 self.push("pop rbp");
@@ -131,7 +143,7 @@ impl AsmWriter {
                 self.push(format!("je .L{:?}", inverse));
                 self.push(format!("jmp .L{:?}\n", destination));
             }
-            Terminator::Jump { destination, } => {
+            Terminator::Jump { destination } => {
                 self.push("# Jump");
                 self.push(format!("jmp .L{:?}\n", destination));
             }
@@ -151,9 +163,9 @@ impl AsmWriter {
         slots: &SlotTable,
         locator: &Locator,
     ) {
+        self.push(format!("# {}", operation));
         match operation {
             Operation::Const(value, litt) => {
-                self.push("# Const");
                 let destination = locator.display(value, &self.tables.type_handler, &frame);
                 match litt {
                     Litteral::Number(n) => {
@@ -169,17 +181,12 @@ impl AsmWriter {
                 }
             }
             Operation::ConstStr(loc, string) => {
-                self.push("# ConstStr");
                 let label = self.push_data(format!(".ascii \"{}\"", string));
                 let value = locator.get(loc);
                 match value.location {
                     ValueLocation::Register(reg) => {
-                        self.push(format!(
-                            "lea {}, [rip + {}]",
-                            reg.with_size(8),
-                            label
-                        ));
-                    },
+                        self.push(format!("lea {}, [rip + {}]", reg.with_size(8), label));
+                    }
                     ValueLocation::Spill(slot) => {
                         let location = frame
                             .stack_map
@@ -198,19 +205,53 @@ impl AsmWriter {
                         ));
                         self.push(format!("mov {}, {}", location, Register::R10.with_size(8)))
                     }
+                    ValueLocation::Unallocated => {
+                        panic!("value is Unallocated");
+                    }
                 }
             }
+            Operation::HugeConst(dest, litt) => {
+                self.push(format!("push rax"));
+                self.push(format!("push rcx"));
+                self.push(format!("push rdi"));
+                self.push(format!("mov rax, {}", litt));
+                let ty = self.tables.type_handler.get(&dest.typeid, None).unwrap();
+                self.push(format!("mov rcx, {}", ty.size / 8));
+                match dest.kind {
+                    PlaceKind::Slot(s) => {
+                        let location = frame
+                            .stack_map
+                            .get(&s)
+                            .ok_or(ResError {
+                                kind: ResErrorKind::SlotNotFound(s.clone()),
+                                position: None,
+                                severity: Severity::Error,
+                            })
+                            .map(|s| s.clone()).unwrap();
+                            self.push(format!("lea rdi, [rbp - 0x{:x}]", location.offset));
+                    },
+                    _ => todo!()
+                }
+                self.push("rep stosq");
+                self.push(format!("pop rdi"));
+                self.push(format!("pop rcx"));
+                self.push(format!("pop rax"));
+            }
             Operation::AddressOf(loc, place) => {
-                self.push("# AddressOf");
                 let value = locator.get(&loc);
-                let ty = self.tables.type_handler.get(&value.typeid, None).unwrap().clone();
-                match place.kind {
+                let ty = self
+                    .tables
+                    .type_handler
+                    .get(&value.typeid, None)
+                    .unwrap()
+                    .clone();
+                match place.kind.clone() {
                     PlaceKind::Slot(slot) => {
                         let rbp_offset = frame.stack_map[&slot].offset;
                         match value.location {
                             ValueLocation::Register(reg) => {
                                 self.push(format!(
-                                    "lea {}, [rbp - {} + {}]",
+                                    "lea {}, [rbp - {:#x} + {:#x}]",
                                     reg.with_size(8),
                                     rbp_offset,
                                     place.offset
@@ -218,12 +259,12 @@ impl AsmWriter {
                             }
                             ValueLocation::Spill(slot) => {
                                 self.push(format!(
-                                    "lea {}, [rbp - {} + {}]",
+                                    "lea {}, [rbp - {:#x} + {:#x}]",
                                     Register::R10.with_size(8),
                                     rbp_offset,
                                     place.offset
                                 ));
-                                let mut location = frame
+                                let location = frame
                                     .stack_map
                                     .get(&slot)
                                     .ok_or(ResError {
@@ -231,19 +272,57 @@ impl AsmWriter {
                                         position: None,
                                         severity: Severity::Error,
                                     })
-                                    .map(|s| s.clone()).unwrap();
-                                
-                                self.push(format!("mov {}, {}", location, &Register::R10.with_size(8)));
+                                    .map(|s| s.clone())
+                                    .unwrap();
+
+                                self.push(format!(
+                                    "mov {}, {}",
+                                    location,
+                                    &Register::R10.with_size(8)
+                                ));
+                            }
+                            ValueLocation::Unallocated => {
+                                panic!("value is Unallocated");
                             }
                         }
                     }
-                    PlaceKind::Pointer(pointer) => { todo!() }
+                    PlaceKind::Pointer(pointer) => {
+                        todo!()
+                    },
+                    PlaceKind::Index { base, index } => {
+                        let base_str = self.place_str(&base, locator, slots).unwrap();
+                        let element_ty = self.tables.type_handler.get(&place.typeid, None).unwrap().clone();
+                        let ((reg, size), (index_reg, _)) = self.dual_value_location(loc.clone(), index, locator, frame);
+                        self.push(format!("lea r11, {}", base_str));
+                        self.push(format!("lea {}, [r11 + {} * {}]", reg.with_size(8), index_reg.with_size(8), element_ty.size));
+                    }
                 }
             }
+            Operation::PointerOffset(dest, base, offset) => {
+                let ((base_reg, base_size), (offset_reg, offset_size)) =
+                    self.dual_value_location(base.clone(), offset.clone(), locator, frame);
+                let dest_value = locator.get(&dest);
+                let dest_type = &self
+                    .tables
+                    .type_handler
+                    .get(&dest_value.typeid, None)
+                    .unwrap();
+                self.push(format!(
+                    "mov {}, [{} + {} * {:#x}]",
+                    locator.display(dest, &self.tables.type_handler, frame),
+                    base_reg.with_size(base_size),
+                    offset_reg.with_size(offset_size),
+                    dest_type.size,
+                ));
+            }
             Operation::Load(loc, place) => {
-                self.push("# Load");
                 let value = locator.get(loc);
-                let ty = self.tables.type_handler.get(&value.typeid, None).unwrap().clone();
+                let ty = self
+                    .tables
+                    .type_handler
+                    .get(&value.typeid, None)
+                    .unwrap()
+                    .clone();
                 match value.location {
                     ValueLocation::Register(reg) => {
                         self.load(&reg, place, ty.size, slots, locator);
@@ -256,29 +335,44 @@ impl AsmWriter {
                             &Register::R10.with_size(ty.size),
                         ));
                     }
+                    ValueLocation::Unallocated => {
+                        panic!("value is Unallocated");
+                    }
+                }
+            }
+            Operation::Cast(dest, src) => {
+                let (sized_src, sized_dest) = self.dual_value_location(src.clone(), dest.clone(), locator, frame);
+                self.casted_move(sized_dest.clone(), sized_src);
+                if RegisterSet::scratch().contains(&sized_dest.0) {
+                    self.push(format!("mov {}, {}", locator.display(dest, &self.tables.type_handler, frame), sized_dest.0.with_size(sized_dest.1)));
                 }
             }
             Operation::Move(dest, src) => {
-                self.push("# Move");
-                let src_str = self.value_location(src.clone(), locator, frame);
+                let src_type_id = locator.get(src).typeid;
+                let (src_reg, src_size) = self.value_location(src.clone(), locator, frame);
                 self.push(format!(
                     "mov {}, {}",
-                    locator.display(dest, &self.tables.type_handler, &frame),
-                    src_str
+                    locator.display(dest, &self.tables.type_handler, frame),
+                    src_reg.with_size(src_size)
                 ));
             }
             Operation::Store(place, loc) => {
-                self.push("# Store");
-                let loc_str = self.value_location(loc.clone(), locator, frame);
-                let place_str = self.place_str(&place, &locator, &slots).unwrap();
-                self.push(format!(
-                    "mov {}, {}",
-                    place_str,
-                    loc_str
-                ));
+                let (reg, size) = self.value_location(loc.clone(), locator, frame);
+                match place.kind.clone() {
+                    PlaceKind::Index { base, index } => {
+                        let base_str = self.place_str(&base, locator, slots).unwrap();
+                        let element_ty = self.tables.type_handler.get(&place.typeid, None).unwrap().clone();
+                        let ((reg, size), (index_reg, _)) = self.dual_value_location(loc.clone(), index, locator, frame);
+                        self.push(format!("lea r11, {}", base_str));
+                        self.push(format!("mov [r11 + {} * {}], {}", index_reg.with_size(8), element_ty.size, reg.with_size(size)));
+                    },
+                    _ => {
+                        let place_str = self.place_str(&place, &locator, &slots).unwrap();
+                        self.push(format!("mov {}, {}", place_str, reg.with_size(size)));
+                    }
+                }
             }
             Operation::Deref(dest, src) => {
-                self.push("# Deref");
                 let src_loc = locator.get(src).location;
                 let dest_loc = locator.get(dest).location;
                 match (src_loc, dest_loc) {
@@ -291,56 +385,72 @@ impl AsmWriter {
                 }
             }
             Operation::Copy(sdest, ssrc, ty) => {
-                self.push("# Copy");
-                let ty = self.tables.type_handler.get(ty, None).unwrap();
-                let mut left: usize = ty.size;
-                let mut offset: usize = 0;
-                println!("copy {:?} <- {:?} ({:?})", sdest, ssrc, ty);
-                let r = Register::R10;
-                while left >= 8 {
-                    self.load(&r, &ssrc.offset(offset, TypeID::U64), 8, slots, locator);
-                    self.store(
-                        &r,
-                        &sdest.offset(offset, TypeID::U64),
-                        8,
-                        slots,
-                        locator,
-                    );
-                    offset += 8;
-                    left -= 8;
+                let ty = self.tables.type_handler.get(ty, None).unwrap().clone();
+                if let TypeKind::Array(element_id, length) = ty.kind {
+                    let element_type = self
+                        .tables
+                        .type_handler
+                        .get(&element_id, None)
+                        .unwrap()
+                        .clone();
+                    if element_type.size <= 8 {
+                        for i in 0..length {
+                            let sstr = self
+                                .place_str(
+                                    &ssrc.offset(element_type.size * i, element_id),
+                                    locator,
+                                    slots,
+                                )
+                                .unwrap();
+                            let dstr = self
+                                .place_str(
+                                    &sdest.offset(element_type.size * i, element_id),
+                                    locator,
+                                    slots,
+                                )
+                                .unwrap();
+                            self.push(format!(
+                                "mov {}, {}",
+                                Register::R10.with_size(element_type.size),
+                                sstr
+                            ));
+                            self.push(format!(
+                                "mov {}, {}",
+                                dstr,
+                                Register::R10.with_size(element_type.size),
+                            ));
+                        }
+                    }
+                } else {
+                    let mut left: usize = ty.size;
+                    let mut offset: usize = 0;
+                    let r = Register::R10;
+                    while left >= 8 {
+                        self.load(&r, &ssrc.offset(offset, TypeID::U64), 8, slots, locator);
+                        self.store(&r, &sdest.offset(offset, TypeID::U64), 8, slots, locator);
+                        offset += 8;
+                        left -= 8;
+                    }
+                    if left >= 4 {
+                        self.load(&r, &ssrc.offset(offset, TypeID::U32), 4, slots, locator);
+                        self.store(&r, &sdest.offset(offset, TypeID::U32), 4, slots, locator);
+                        offset += 4;
+                        left -= 4;
+                    }
+                    if left >= 2 {
+                        self.load(&r, &ssrc.offset(offset, TypeID::U16), 2, slots, locator);
+                        self.store(&r, &sdest.offset(offset, TypeID::U16), 2, slots, locator);
+                        offset += 2;
+                        left -= 2;
+                    }
+                    if left == 1 {
+                        self.load(&r, &ssrc.offset(offset, TypeID::U8), 1, slots, locator);
+                        self.store(&r, &sdest.offset(offset, TypeID::U8), 1, slots, locator);
+                    }
+                    self.push("");
                 }
-                if left >= 4 {
-                    self.load(&r, &ssrc.offset(offset, TypeID::U32), 4, slots, locator);
-                    self.store(
-                        &r,
-                        &sdest.offset(offset, TypeID::U32),
-                        4,
-                        slots,
-                        locator,
-                    );
-                    offset += 4;
-                    left -= 4;
-                }
-                if left >= 2 {
-                    self.load(&r, &ssrc.offset(offset, TypeID::U16), 2, slots, locator);
-                    self.store(
-                        &r,
-                        &sdest.offset(offset, TypeID::U16),
-                        2,
-                        slots,
-                        locator,
-                    );
-                    offset += 2;
-                    left -= 2;
-                }
-                if left == 1 {
-                    self.load(&r, &ssrc.offset(offset, TypeID::U8), 1, slots, locator);
-                    self.store(&r, &sdest.offset(offset, TypeID::U8), 1, slots, locator);
-                }
-                self.push("");
             }
             Operation::Eq(_, sdest, s1, s2) => {
-                self.push("# Eq");
                 self.boolean_operator_prefix(locator, s1, s2, &frame);
                 self.push(format!(
                     "sete {}\n",
@@ -348,7 +458,6 @@ impl AsmWriter {
                 ));
             }
             Operation::NEq(_, sdest, s1, s2) => {
-                self.push("# NEq");
                 let ldest = self.boolean_operator_prefix(locator, s1, s2, &frame);
                 self.push(format!(
                     "setne {}\n",
@@ -356,7 +465,6 @@ impl AsmWriter {
                 ));
             }
             Operation::G(_, sdest, s1, s2) => {
-                self.push("# G");
                 let ldest = self.boolean_operator_prefix(locator, s1, s2, &frame);
                 self.push(format!(
                     "seta {}\n",
@@ -364,7 +472,6 @@ impl AsmWriter {
                 ));
             }
             Operation::GEq(_, sdest, s1, s2) => {
-                self.push("# GEq");
                 let ldest = self.boolean_operator_prefix(locator, s1, s2, &frame);
                 self.push(format!(
                     "setae {}\n",
@@ -372,7 +479,6 @@ impl AsmWriter {
                 ));
             }
             Operation::L(_, sdest, s1, s2) => {
-                self.push("# L");
                 let ldest = self.boolean_operator_prefix(locator, s1, s2, &frame);
                 self.push(format!(
                     "setb {}\n",
@@ -380,7 +486,6 @@ impl AsmWriter {
                 ));
             }
             Operation::LEq(_, sdest, s1, s2) => {
-                self.push("# LEq");
                 let ldest = self.boolean_operator_prefix(locator, s1, s2, &frame);
                 self.push(format!(
                     "setbe {}\n",
@@ -388,49 +493,123 @@ impl AsmWriter {
                 ));
             }
             Operation::Add(ty, sdest, s1, s2) => {
-                self.push("# Add");
                 let ldest = locator.display(&sdest, &self.tables.type_handler, &frame);
-                let (l1, l2) = self.dual_value_location(s1.clone(), s2.clone(), locator, frame);
+                let ((l1, size1), (l2, size2)) =
+                    self.dual_value_location(s1.clone(), s2.clone(), locator, frame);
+                let (l1, l2) = (l1.with_size(size1), l2.with_size(size2));
                 self.push(format!("add {}, {}", l1, l2));
                 self.push(format!("mov {}, {}", ldest, l1));
                 self.push("");
             }
             Operation::Sub(ty, sdest, s1, s2) => {
-                self.push("# Sub");
                 let ldest = locator.display(&sdest, &self.tables.type_handler, &frame);
-                let (l1, l2) = self.dual_value_location(s1.clone(), s2.clone(), locator, frame);
+                let ((l1, size1), (l2, size2)) =
+                    self.dual_value_location(s1.clone(), s2.clone(), locator, frame);
+                let (l1, l2) = (l1.with_size(size1), l2.with_size(size2));
                 self.push(format!("sub {}, {}", l1, l2));
                 self.push(format!("mov {}, {}", ldest, l1));
                 self.push("");
             }
             Operation::Mul(ty, sdest, s1, s2) => {
-                self.push("# Mul");
                 let ldest = locator.display(&sdest, &self.tables.type_handler, &frame);
-                let (l1, l2) = self.dual_value_location(s1.clone(), s2.clone(), locator, frame);
+                let ((l1, size1), (l2, size2)) =
+                    self.dual_value_location(s1.clone(), s2.clone(), locator, frame);
+                let (l1, l2) = (l1.with_size(size1), l2.with_size(size2));
                 self.push(format!("imul {}, {}", l1, l2));
                 self.push(format!("mov {}, {}", ldest, l1));
                 self.push("");
             }
-            Operation::Call(dest, id, slots) => {
-                self.push("# Call");
+            Operation::Div(ty, sdest, s1, s2, remainder) => {
+                let ldest = self.value_location(*sdest, locator, frame);
+                self.push(format!("push rax"));
+                self.push(format!("push rdx"));
+                let ((l1, size1), (l2, size2)) =
+                    self.dual_value_location(s1.clone(), s2.clone(), locator, frame);
+                //let l2 = self.if_register(l2, Register::R10, Register::R11, size2);
+                let l1 = self.if_register(l1, Register::D, Register::R10, size1);
+                let l2 = self.if_register(l2, Register::D, Register::R11, size2);
+                let (l1, l2) = (l1.with_size(size1), l2.with_size(size2));
+                self.push("xor rdx, rdx");
+                self.push(format!("mov {}, {}", Register::A.with_size(size1), l1));
+                self.push(format!("div {}", l2));
+                if *remainder {
+                    if size1 == 1 {
+                        self.push(format!("mov dl, ah"));
+                        self.casted_move(ldest.clone(), (Register::D, size2));
+                    } else {
+                        self.casted_move(ldest.clone(), (Register::D, size2));
+                    }
+                } else {
+                    self.casted_move(ldest.clone(), (Register::A, size2));
+                }
+                match locator.get(sdest).location {
+                    ValueLocation::Spill(s) => self.push(format!(
+                        "mov {}, {}",
+                        locator.display(sdest, &self.tables.type_handler, frame),
+                        ldest.0.with_size(ldest.1)
+                    )),
+                    _ => (),
+                }
+                self.push("pop rdx");
+                self.push("pop rax");
+                self.push("");
+            }
+            Operation::Call(dest_opt, id, values) => {
                 let func = self.tables.func_table.get(id).clone();
-                for (i, (value_id, type_id)) in slots.iter().zip(func.params).enumerate() {
-                    let t = self.tables.type_handler.get(&type_id, None).unwrap();
-                    let reg = &ARG_REGISTERS[i];
+                let mut pop_registers: Vec<(&Register, usize)> = Vec::new();
+                for (i, (value_id, type_id)) in values.iter().zip(func.params).enumerate() {
+                    let t = self
+                        .tables
+                        .type_handler
+                        .get(&type_id, None)
+                        .unwrap()
+                        .clone();
+                    let value = locator.get(value_id);
+                    match value.location {
+                        ValueLocation::Register(reg) => {
+                            if reg == ARG_REGISTERS[i] {
+                                continue;
+                            }
+                            if reg.is_arg(values.iter().len(), i) {
+                                self.push(format!("push {}", reg.with_size(t.size.max(8))));
+                                pop_registers.push((&ARG_REGISTERS[i], t.size));
+                            } else {
+                                self.push(format!(
+                                    "mov {}, {}",
+                                    ARG_REGISTERS[i].with_size(t.size),
+                                    reg.with_size(t.size)
+                                ));
+                            }
+                        }
+                        ValueLocation::Spill(s) => {
+                            self.push(format!(
+                                "mov {}, {}",
+                                ARG_REGISTERS[i].with_size(t.size),
+                                locator.display(value_id, &self.tables.type_handler, frame)
+                            ));
+                        }
+                        ValueLocation::Unallocated => {
+                            panic!("value is Unallocated");
+                        }
+                    }
+                }
+                for (reg, size) in pop_registers.iter().rev() {
+                    self.push(format!("pop {}", Register::R10.with_size(8)));
                     self.push(format!(
                         "mov {}, {}",
-                        reg.with_size(t.size),
-                        locator.display(value_id, &self.tables.type_handler, &frame)
-                    ));
+                        reg.with_size(size.clone()),
+                        Register::R10.with_size(size.clone())
+                    ))
                 }
                 self.push(format!("call {}", func.identifier));
-                let ty = &self.tables.type_handler.get(&func.ret, None).unwrap();
-                if ty.size != 0 {
+                if let Some(dest) = dest_opt {
+                    let size = locator.get(&dest).size(&self.tables.type_handler);
                     let l = locator.display(&dest, &self.tables.type_handler, &frame);
-                    self.push(format!("mov {}, {}", l, Register::A.with_size(ty.size)));
+                    self.push(format!("mov {}, {}", l, Register::A.with_size(size)));
                 }
                 self.push("");
             }
+            Operation::NOP => (),
             o => {
                 println!("{:?}", o);
                 todo!()
@@ -438,38 +617,93 @@ impl AsmWriter {
         }
     }
 
-    pub fn value_location(&mut self, id: ValueID, locator: &Locator, frame: &StackFrame) -> String {
-        let value = locator.get(&id);
-        let ty = self.tables.type_handler.get(&value.typeid, None).unwrap().clone();
-        match value.location {
-            ValueLocation::Register(reg) => {
-                format!("{}", reg.with_size(ty.size))
-            },
-            ValueLocation::Spill(slot) => {
-                let location = frame
-                    .stack_map
-                    .get(&slot)
-                    .ok_or(ResError {
-                        kind: ResErrorKind::SlotNotFound(slot.clone()),
-                        position: None,
-                        severity: Severity::Error,
-                    })
-                    .map(|s| s.clone())
-                    .unwrap();
-                self.push(format!("mov {}, {}", &Register::R10.with_size(ty.size), location));
-                format!("{}", &Register::R10.with_size(ty.size))
+    pub fn casted_move(
+        &mut self,
+        (dest_reg, dest_size): (Register, usize),
+        (src_reg, src_size): (Register, usize),
+    ) {
+        if dest_reg == src_reg && dest_size == src_size {
+            return;
+        }
+        match (dest_size, src_size) {
+            (0 | 3 | 5 | 6 | 7, _) | (_, 0 | 3 | 5 | 6 | 7) | (9.., _) | (_, 9..) => {
+                panic!()
+            }
+            (1, _) => self.push(format!(
+                "movzx {}, {}",
+                dest_reg.with_size(4),
+                src_reg.with_size(1)
+            )),
+            (4 | 8, 2) => self.push(format!(
+                "movzx {}, {}",
+                dest_reg.with_size(4),
+                src_reg.with_size(2)
+            )),
+            (8, 4) => self.push(format!(
+                "mov {}, {}",
+                dest_reg.with_size(4),
+                src_reg.with_size(4)
+            )),
+            (_, 1) => self.push(format!(
+                "movzx {}, {}",
+                dest_reg.with_size(4),
+                src_reg.with_size(1)
+            )),
+            (2, 4 | 8) => self.push(format!(
+                "movzx {}, {}",
+                dest_reg.with_size(4),
+                src_reg.with_size(2)
+            )),
+            (4, 8) => self.push(format!(
+                "mov {}, {}",
+                dest_reg.with_size(4),
+                src_reg.with_size(4)
+            )),
+            _ => {
+                assert_eq!(src_size, dest_size);
+                self.push(format!(
+                    "mov {}, {}",
+                    dest_reg.with_size(4),
+                    src_reg.with_size(4)
+                ))
             }
         }
     }
 
-    pub fn dual_value_location(&mut self, id1: ValueID, id2: ValueID, locator: &Locator, frame: &StackFrame) -> (String, String) {
-        let first_value = self.value_location(id1, locator, frame);
-        let value = locator.get(&id2);
-        let ty = self.tables.type_handler.get(&value.typeid, None).unwrap().clone();
+    pub fn if_register(
+        &mut self,
+        reg: Register,
+        predicate: Register,
+        then: Register,
+        size: usize,
+    ) -> Register {
+        if reg == predicate {
+            self.push(format!(
+                "mov {}, {}",
+                then.with_size(size),
+                reg.with_size(size)
+            ));
+            then
+        } else {
+            reg
+        }
+    }
+
+    pub fn value_location(
+        &mut self,
+        id: ValueID,
+        locator: &Locator,
+        frame: &StackFrame,
+    ) -> (Register, usize) {
+        let value = locator.get(&id);
+        let ty = self
+            .tables
+            .type_handler
+            .get(&value.typeid, None)
+            .unwrap()
+            .clone();
         match value.location {
-            ValueLocation::Register(reg) => {
-                (first_value, format!("{}", reg.with_size(ty.size)))
-            },
+            ValueLocation::Register(reg) => (reg, ty.size),
             ValueLocation::Spill(slot) => {
                 let location = frame
                     .stack_map
@@ -481,8 +715,56 @@ impl AsmWriter {
                     })
                     .map(|s| s.clone())
                     .unwrap();
-                self.push(format!("mov {}, {}", &Register::R11.with_size(ty.size), location));
-                (first_value, format!("{}", &Register::R11.with_size(ty.size)))
+                self.push(format!(
+                    "mov {}, {}",
+                    &Register::R10.with_size(ty.size),
+                    location
+                ));
+                (Register::R10, ty.size)
+            }
+            ValueLocation::Unallocated => {
+                panic!("value {} is Unallocated", id);
+            }
+        }
+    }
+
+    pub fn dual_value_location(
+        &mut self,
+        id1: ValueID,
+        id2: ValueID,
+        locator: &Locator,
+        frame: &StackFrame,
+    ) -> ((Register, usize), (Register, usize)) {
+        let first_value = self.value_location(id1, locator, frame);
+        let value = locator.get(&id2);
+        let ty = self
+            .tables
+            .type_handler
+            .get(&value.typeid, None)
+            .unwrap()
+            .clone();
+        match value.location {
+            ValueLocation::Register(reg) => (first_value, (reg, ty.size)),
+            ValueLocation::Spill(slot) => {
+                let location = frame
+                    .stack_map
+                    .get(&slot)
+                    .ok_or(ResError {
+                        kind: ResErrorKind::SlotNotFound(slot.clone()),
+                        position: None,
+                        severity: Severity::Error,
+                    })
+                    .map(|s| s.clone())
+                    .unwrap();
+                self.push(format!(
+                    "mov {}, {}",
+                    &Register::R11.with_size(ty.size),
+                    location
+                ));
+                (first_value, (Register::R11, ty.size))
+            }
+            ValueLocation::Unallocated => {
+                panic!("value is Unallocated");
             }
         }
     }
@@ -494,7 +776,9 @@ impl AsmWriter {
         s2: &ValueID,
         frame: &StackFrame,
     ) {
-        let (l1, l2) = self.dual_value_location(s1.clone(), s2.clone(), locator, frame);
+        let ((l1, size1), (l2, size2)) =
+            self.dual_value_location(s1.clone(), s2.clone(), locator, frame);
+        let (l1, l2) = (l1.with_size(size1), l2.with_size(size2));
         self.push(format!("cmp {}, {}", l1, l2));
     }
 
@@ -521,14 +805,10 @@ impl AsmWriter {
         let reg_str = reg.with_size(size.max(8));
         if size <= 2 && !location.is_pointer() {
             let place_str = self.place_str(location, locator, slots).unwrap();
-            self.push(format!(
-                "movzx {reg_str}, {}", place_str
-            ))
+            self.push(format!("movzx {reg_str}, {}", place_str))
         } else {
             let place_str = self.place_str(location, locator, slots).unwrap();
-            self.push(format!(
-                "mov {reg_str}, {}", place_str
-            ))
+            self.push(format!("mov {reg_str}, {}", place_str))
         }
     }
 
@@ -548,10 +828,7 @@ impl AsmWriter {
     ) {
         let reg_str = reg.with_size(size);
         let place_str = self.place_str(location, locator, slots).clone().unwrap();
-        self.push(format!(
-            "mov {}, {reg_str}",
-            place_str
-        ))
+        self.push(format!("mov {}, {reg_str}", place_str))
     }
 
     pub fn place_str(
@@ -561,7 +838,7 @@ impl AsmWriter {
         slots: &SlotTable,
     ) -> ResResult<String> {
         let frame = slots.stack_frame(&self.tables.type_handler);
-        match place.kind {
+        match place.kind.clone() {
             PlaceKind::Slot(s) => {
                 let mut location = frame
                     .stack_map
@@ -576,18 +853,20 @@ impl AsmWriter {
                 location.size = location
                     .size
                     .min(self.tables.type_handler.get(&place.typeid, None)?.size);
+
+                if location.offset == 0 {
+                    panic!("stack underflow on place: {:?}", place);
+                }
                 Ok(format!("{}", location))
             }
             PlaceKind::Pointer(id) => {
                 let value = locator.get(&id);
                 match value.location {
-                    ValueLocation::Register(_) => {
-                        Ok(format!(
-                            "[{} + {}]",
-                            locator.display(&id, &self.tables.type_handler, &frame),
-                            place.offset
-                        ))
-                    },
+                    ValueLocation::Register(_) => Ok(format!(
+                        "[{} + {:#x}]",
+                        locator.display(&id, &self.tables.type_handler, &frame),
+                        place.offset
+                    )),
                     ValueLocation::Spill(s) => {
                         let slot = slots.get(s);
                         let mut location = frame
@@ -600,9 +879,19 @@ impl AsmWriter {
                             })
                             .map(|s| s.clone())?;
                         self.push(format!("mov {}, {}", &Register::R10.with_size(8), location));
-                        Ok(format!("[{} + {}]", &Register::R10.with_size(8), place.offset))
+                        Ok(format!(
+                            "[{} + {:#x}]",
+                            &Register::R10.with_size(8),
+                            place.offset
+                        ))
+                    }
+                    ValueLocation::Unallocated => {
+                        panic!("value is Unallocated");
                     }
                 }
+            },
+            PlaceKind::Index { base, index } => {
+                todo!()
             }
         }
     }
@@ -668,6 +957,31 @@ impl Register {
                 8 => format!("r{}", base),
                 _ => unreachable!(),
             },
+        }
+    }
+
+    pub fn is_arg(&self, num_args: usize, except: usize) -> bool {
+        if self.clone() == ARG_REGISTERS[except] {
+            return false;
+        }
+        match (num_args, self) {
+            (0, _) => unreachable!(),
+            (1, Register::DI) => true,
+            (2, Register::DI | Register::SI) => true,
+            (3, Register::DI | Register::SI | Register::D) => true,
+            (4, Register::DI | Register::SI | Register::D | Register::C) => true,
+            (5, Register::DI | Register::SI | Register::D | Register::C | Register::R8) => true,
+            (
+                6,
+                Register::DI
+                | Register::SI
+                | Register::D
+                | Register::C
+                | Register::R8
+                | Register::R9,
+            ) => true,
+            (1..=6, _) => false,
+            (7.., _) => todo!(),
         }
     }
 }

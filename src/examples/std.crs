@@ -1,0 +1,21 @@
+
+
+struct Allocator {
+    start: usize,
+    current: usize,
+    end: usize,
+}
+
+fun allocator_new() -> Allocator {
+    let size: usize = 65536;
+
+    let ptr: usize = mmap(size) as usize;
+
+    let alloc = Allocator {
+        start: ptr,
+        current: ptr,
+        end: ptr + size
+    };
+
+    return alloc;
+}
