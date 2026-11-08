@@ -1,17 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    error::{ResError, ResErrorKind, ResResult, Severity},
-    functions::{self, FuncID, FuncSignature},
-    lexer::Position,
-    locations::{Locator, RegisterSet, StackLocation, Value, ValueLocation},
-    parser::Litteral,
-    ssa::{
-        BasicBlock, Function, Operation, Place, PlaceKind, SSA, SlotID, SlotTable, StackFrame,
-        Terminator, ValueID,
-    },
-    symbols::SymbolID,
-    types::{Tables, TypeID, TypeKind},
+    error::{AnyResult, IRError, IRErrorKind, IRResult, ResError, ResErrorKind, Severity, TypeError, TypeResult}, functions::{self, FuncID, FuncSignature}, lexer::Position, parser::Litteral, ssa::{BasicBlock, Function, Locator, Operation, Place, PlaceKind, RegisterSet, SlotTable, StackFrame, Terminator, ValueID, ValueLocation}, symbols::SymbolID, types::{Tables, TypeID, TypeKind}
 };
 pub struct AsmWriter {
     tables: Tables,
@@ -115,7 +105,7 @@ impl AsmWriter {
         frame: &StackFrame,
     ) {
         match terminator {
-            Terminator::Return { value } => {
+            Terminator::ReturnValue { value } => {
                 self.push("# Return");
                 if let Some(value) = value {
                     let l = locator.get(&value);
@@ -247,6 +237,7 @@ impl AsmWriter {
                     .clone();
                 match place.kind.clone() {
                     PlaceKind::Slot(slot) => {
+                        println!("{} - {:?}", loc, &slot);
                         let rbp_offset = frame.stack_map[&slot].offset;
                         match value.location {
                             ValueLocation::Register(reg) => {
@@ -555,8 +546,15 @@ impl AsmWriter {
                 self.push("");
             }
             Operation::Call(dest_opt, id, values) => {
-                let func = self.tables.func_table.get(id).clone();
-                let mut pop_registers: Vec<(&Register, usize)> = Vec::new();
+                let mut func = self.tables.func_table.get(id).clone();
+                func.transform(&mut self.tables.type_handler).unwrap();
+                let mut inner_pop_registers: Vec<(Register, usize)> = Vec::new();
+                let mut outer_pop_registers: Vec<Register> = Vec::new();
+                for reg in locator.allocated_args().clone() {
+                    let reg = reg.clone();
+                    self.push(format!("push {}", reg.with_size(8)));
+                    outer_pop_registers.push(reg);
+                }
                 for (i, (value_id, type_id)) in values.iter().zip(func.params).enumerate() {
                     let t = self
                         .tables
@@ -572,7 +570,7 @@ impl AsmWriter {
                             }
                             if reg.is_arg(values.iter().len(), i) {
                                 self.push(format!("push {}", reg.with_size(t.size.max(8))));
-                                pop_registers.push((&ARG_REGISTERS[i], t.size));
+                                inner_pop_registers.push((ARG_REGISTERS[i].clone(), t.size));
                             } else {
                                 self.push(format!(
                                     "mov {}, {}",
@@ -593,7 +591,7 @@ impl AsmWriter {
                         }
                     }
                 }
-                for (reg, size) in pop_registers.iter().rev() {
+                for (reg, size) in inner_pop_registers.iter().rev() {
                     self.push(format!("pop {}", Register::R10.with_size(8)));
                     self.push(format!(
                         "mov {}, {}",
@@ -606,6 +604,9 @@ impl AsmWriter {
                     let size = locator.get(&dest).size(&self.tables.type_handler);
                     let l = locator.display(&dest, &self.tables.type_handler, &frame);
                     self.push(format!("mov {}, {}", l, Register::A.with_size(size)));
+                }
+                for reg in outer_pop_registers.iter().rev() {
+                    self.push(format!("pop {}", reg.with_size(8)));
                 }
                 self.push("");
             }
@@ -827,7 +828,7 @@ impl AsmWriter {
         locator: &Locator,
     ) {
         let reg_str = reg.with_size(size);
-        let place_str = self.place_str(location, locator, slots).clone().unwrap();
+        let place_str = self.place_str(location, locator, slots).unwrap().clone();
         self.push(format!("mov {}, {reg_str}", place_str))
     }
 
@@ -836,17 +837,16 @@ impl AsmWriter {
         place: &Place,
         locator: &Locator,
         slots: &SlotTable,
-    ) -> ResResult<String> {
+    ) -> AnyResult<String> {
         let frame = slots.stack_frame(&self.tables.type_handler);
         match place.kind.clone() {
             PlaceKind::Slot(s) => {
                 let mut location = frame
                     .stack_map
                     .get(&s)
-                    .ok_or(ResError {
-                        kind: ResErrorKind::SlotNotFound(s.clone()),
+                    .ok_or(IRError {
+                        kind: IRErrorKind::SlotNotFound(s.clone()),
                         position: None,
-                        severity: Severity::Error,
                     })
                     .map(|s| s.clone())?;
                 location.offset -= place.offset;
@@ -872,10 +872,9 @@ impl AsmWriter {
                         let mut location = frame
                             .stack_map
                             .get(&s)
-                            .ok_or(ResError {
-                                kind: ResErrorKind::SlotNotFound(s.clone()),
+                            .ok_or(IRError {
+                                kind: IRErrorKind::SlotNotFound(s.clone()),
                                 position: None,
-                                severity: Severity::Error,
                             })
                             .map(|s| s.clone())?;
                         self.push(format!("mov {}, {}", &Register::R10.with_size(8), location));
@@ -922,6 +921,9 @@ pub const ARG_REGISTERS: [Register; 6] = [
 
 impl Register {
     pub fn with_size(&self, size: usize) -> String {
+        if size > 8 {
+            panic!("expected scalar size, got {}", size);
+        }
         use self::*;
         let base = match &self {
             Register::A => "a",
@@ -939,22 +941,22 @@ impl Register {
             Register::A | Register::B | Register::C | Register::D => match size {
                 1 => format!("{}l", base),
                 2 => format!("{}x", base),
-                4 => format!("e{}x", base),
-                8 => format!("r{}x", base),
+                ..=4 => format!("e{}x", base),
+                ..=8 => format!("r{}x", base),
                 _ => unreachable!(),
             },
             Register::R8 | Register::R9 | Register::R10 | Register::R11 => match size {
                 1 => format!("{}b", base),
                 2 => format!("{}w", base),
-                4 => format!("{}d", base),
-                8 => format!("{}", base),
+                ..=4 => format!("{}d", base),
+                ..=8 => format!("{}", base),
                 _ => unreachable!(),
             },
             Register::SI | Register::DI => match size {
                 1 => format!("{}l", base),
                 2 => format!("{}", base),
-                4 => format!("e{}", base),
-                8 => format!("r{}", base),
+                ..=4 => format!("e{}", base),
+                ..=8 => format!("r{}", base),
                 _ => unreachable!(),
             },
         }

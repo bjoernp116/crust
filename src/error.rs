@@ -1,12 +1,39 @@
-use std::{collections::{HashMap, hash_map::Keys}, fmt::Debug, hash::Hash, io::Write, ops::AddAssign};
+use std::{any::type_name, collections::{HashMap, hash_map::Keys}, fmt::Debug, hash::Hash, io::Write, ops::AddAssign};
 
 use colored::Colorize;
 
 use crate::{
-    asm::Register, functions::FuncID, lexer::{Position, Token, TokenType}, locations::RegisterSet, parser::Node, ssa::SlotID, symbols::{Symbol, SymbolID}, types::{LoopContext, TypeHandler, TypeID, TypedNode, TypedStatement}
+    Command::Parse, asm::Register, functions::FuncID, lexer::{Position, Token, TokenType}, parser::Node, ssa::{RegisterSet, SlotID}, structs::FieldID, symbols::{Symbol, SymbolID}, types::{LoopContext, TypeHandler, TypeID, TypedNode, TypedStatement}
 };
 
-pub type ResResult<T> = Result<T, ResError>;
+pub type CrustResult<T, E: CrustError> = Result<T, E>;
+pub type ParserResult<T> = CrustResult<T, ParserError>;
+pub type TypeResult<T> = CrustResult<T, TypeError>;
+pub type IRResult<T> = CrustResult<T, IRError>;
+pub type AnyResult<T> = Result<T, AnyError>;
+
+pub enum AnyError {
+    Parser(ParserError),
+    Type(TypeError),
+    IR(IRError),
+}
+
+impl<E: CrustError> From<E> for AnyError {
+    fn from(value: E) -> Self {
+        value.to_any()
+    }
+}
+
+impl Debug for AnyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parser(e) => write!(f, "{:?}", e),
+            Self::Type(e) => write!(f, "{:?}", e),
+            Self::IR(e) => write!(f, "{:?}", e),
+        }
+    }
+}
+
 
 #[derive(Clone)]
 pub enum Severity {
@@ -24,6 +51,258 @@ impl Debug for Severity {
         }
     }
 }
+
+pub trait CrustError: Sized + Debug {
+    type Kind;
+    fn new_err(kind: Self::Kind, position: Position) -> Self;
+    fn to_string(&self, th: &TypeHandler) -> String;
+    fn severity(&self) -> Severity;
+    fn position(&self) -> Option<Position>;
+    fn to_any(self) -> AnyError;
+    fn from_any(any: AnyError) -> Option<Self>;
+}
+
+pub struct IRError {
+    pub kind: IRErrorKind,
+    pub position: Option<Position>
+}
+
+impl Debug for IRError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_string(&TypeHandler::new()))
+    }
+}
+
+impl CrustError for IRError {
+    type Kind = IRErrorKind;
+    fn severity(&self) -> Severity {
+        Severity::Error
+    }
+    fn position(&self) -> Option<Position> {
+        None
+    }
+    fn new_err(kind: Self::Kind, position: Position) -> Self {
+        Self { kind, position: Some(position) }
+    }
+    fn to_any(self) -> AnyError {
+        AnyError::IR(self)
+    }
+    fn from_any(any: AnyError) -> Option<Self> {
+        if let AnyError::IR(e) = any { Some(e) } else { None }
+    }
+    fn to_string(&self, th: &TypeHandler) -> String {
+        match &self.kind {
+            IRErrorKind::ExpectedPlace(node) => {
+                format!("expected place, got {:?}", node)
+            }
+            IRErrorKind::ExpectedScalar(node) => {
+                format!("expected scalar value, got {:?}", node)
+            }
+            IRErrorKind::Unreachable => {
+                format!("statement is unreachable")
+            },
+            IRErrorKind::ExpectedReturnValue(_) => {
+                format!("expected return value")
+            },
+            IRErrorKind::ExpectedElse(_) => {
+                format!("expected else if then block is open")
+            }
+            IRErrorKind::SlotNotFound(slot) => {
+                format!("slot {:?} not found in stack frame", slot)
+            },
+        }
+    }
+}
+
+pub enum IRErrorKind {
+    Unreachable,
+    ExpectedReturnValue(TypeID),
+    ExpectedPlace(TypedNode),
+    ExpectedScalar(TypedNode),
+    ExpectedElse(TypeID),
+    SlotNotFound(SlotID)
+}
+
+
+pub struct TypeError {
+    pub kind: TypeErrorKind,
+    pub position: Option<Position>,
+}
+impl Debug for TypeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_string(&TypeHandler::new()))
+    }
+}
+
+impl CrustError for TypeError {
+    type Kind = TypeErrorKind;
+
+    fn from_any(any: AnyError) -> Option<Self> {
+        if let AnyError::Type(e) = any { Some(e) } else { None }
+    }
+    fn new_err(kind: Self::Kind, position: Position) -> Self {
+        TypeError { kind, position: Some(position) }
+    }
+    fn to_any(self) -> AnyError {
+        AnyError::Type(self)
+    }
+    fn to_string(&self, th: &TypeHandler) -> String {
+        match &self.kind {
+            Self::Kind::TypeMismatch(exp, got) => format!("expected type {:?}, got {:?}", exp, got),
+            Self::Kind::ExpectedStruct => {
+                format!("expected struct")
+            }
+            Self::Kind::UnknownType(ident) => format!("cannot find type {} in this scope", ident),
+            Self::Kind::NotInferableNode => {
+                format!("expression cant be infered")
+            }
+            Self::Kind::NotInferableStmt => {
+                format!("statement cant be infered")
+            }
+            Self::Kind::UnknownFunction(ident) => {
+                format!("cannot find function {} in this scope", ident)
+            }
+            Self::Kind::UnexpectedBreak(ctx) => {
+                format!("cant break with value in a {:?} loop", ctx)
+            },
+            Self::Kind::ExpectedNonArray(exp) => format!(
+                "expected type {}, got array constructor",
+                th.err_string(exp),
+            ),
+            Self::Kind::ExpectedArray(exp) => format!(
+                "expected array, got {}",
+                th.err_string(exp),
+            ),
+            Self::Kind::CantDeref(ty) => format!("cannot dereference type {}", th.err_string(ty)),
+            Self::Kind::UnknownVariable(ident) => {
+                format!("cannot find variable {} in this scope", ident)
+            }
+            Self::Kind::ExpectedVariable(ident, id) => {
+                format!("expected variable {}, found function with {:?}", ident, id)
+            }
+            Self::Kind::ExpectedFunction(ident, id) => {
+                format!("expected function {}, found variable with {:?}", ident, id)
+            }
+            Self::Kind::NoTypeInfo(t1, t2) => {
+                format!("not possible to infer types between {:?} and {:?}", t1, t2)
+            }
+            Self::Kind::CantAssignImmutable(sym) => {
+                format!("cant assign to immutable symbol {}", sym.identifier.green())
+            }
+            Self::Kind::FieldNotFound(field, ty) => {
+                format!("field {} not found on type {}", field, th.err_string(ty))
+            }
+            Self::Kind::UnknownField(ident, struc) => {
+                format!("cannot find field {} in this struct {}", ident, struc)
+            }
+        }
+    }
+    fn position(&self) -> Option<Position> {
+        self.position
+    }
+    fn severity(&self) -> Severity {
+        Severity::Error
+    }
+}
+
+pub enum TypeErrorKind {
+    TypeMismatch(TypeID, TypeID),
+    ExpectedStruct,
+    UnknownType(String),
+    NotInferableNode,
+    NotInferableStmt, 
+    UnknownFunction(String),
+    UnexpectedBreak(LoopContext),
+    ExpectedNonArray(TypeID),
+    ExpectedArray(TypeID),
+    CantDeref(TypeID),
+    UnknownVariable(String),
+    ExpectedVariable(String, FuncID),
+    ExpectedFunction(String, SymbolID),
+    NoTypeInfo(TypeID, TypeID),
+    CantAssignImmutable(Symbol),
+    FieldNotFound(String, TypeID),
+    UnknownField(String, String)
+}
+
+pub struct ParserError {
+    pub kind: ParserErrorKind,
+    pub position: Position,
+}
+
+impl Debug for ParserError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_string(&TypeHandler::new()))
+    }
+}
+
+impl CrustError for ParserError {
+    type Kind = ParserErrorKind;
+    fn new_err(kind: Self::Kind, position: Position) -> Self {
+        Self { kind, position }
+    }
+    fn to_any(self) -> AnyError {
+        AnyError::Parser(self)
+    }
+    fn from_any(any: AnyError) -> Option<Self> {
+        if let AnyError::Parser(e) = any { Some(e) } else { None }
+    }
+    fn to_string(&self, th: &TypeHandler) -> String {
+        match &self.kind {
+            Self::Kind::ExpectedIdentifier => {
+                format!("expected identifier")
+            }
+            Self::Kind::ExpectedNumerical(got) => format!(
+                "expected numerical type, got {}",
+                th.err_string(&got)
+            ),
+            Self::Kind::ExpectedInitializerList => {
+                format!("expected initializer list")
+            }
+            Self::Kind::ExpectedTypeIdentifier => {
+                format!("expected type identifier")
+            }
+            Self::Kind::UnexpectedEOF => {
+                format!("unexpected end of file")
+            }
+            Self::Kind::ExpectedSeparator(got) => {
+                format!("expected separator, got {}", got)
+            }
+            Self::Kind::ExpectedExpression => {
+                format!("expected expression")
+            }
+            Self::Kind::TokenToOperator(token) => {
+                format!("cant convert token {:?} to operator", token)
+            }
+            Self::Kind::ExpectedSemicolon(token) => {
+                format!("expected semicolon, got {}", token.raw)
+            }
+            Self::Kind::UnescapedParenthesis => {
+                format!("unescaped parenthesis")
+            }
+        }
+    }
+    fn severity(&self) -> Severity {
+        Severity::Error
+    }
+    fn position(&self) -> Option<Position> {
+        Some(self.position)
+    }
+}
+
+pub enum ParserErrorKind {
+    ExpectedIdentifier,
+    ExpectedInitializerList,
+    ExpectedTypeIdentifier,
+    ExpectedNumerical(TypeID),
+    ExpectedSemicolon(Token),
+    UnexpectedEOF,
+    ExpectedSeparator(Token),
+    UnescapedParenthesis,
+    ExpectedExpression,
+    TokenToOperator(TokenType)
+}
+
 
 #[derive(Clone)]
 pub struct ResError {
@@ -50,7 +329,17 @@ impl ResError {
     }
 }
 
-pub fn unwrap_print<T>(res: ResResult<T>, file_contents: &String, type_handler: &TypeHandler) -> T {
+pub fn unwrap_any<T>(res: AnyResult<T>, file_contents: &String, type_handler: &TypeHandler) -> T {
+    match res {
+        Ok(t) => return t,
+        Err(AnyError::Parser(e)) => print_err(e, file_contents, type_handler),
+        Err(AnyError::Type(e)) => print_err(e, file_contents, type_handler),
+        Err(AnyError::IR(e)) => print_err(e, file_contents, type_handler),
+    }
+    std::process::exit(-1);
+}
+
+pub fn unwrap_print<T, E: CrustError>(res: CrustResult<T, E>, file_contents: &String, type_handler: &TypeHandler) -> T {
     match res {
         Ok(t) => t,
         Err(e) => {
@@ -59,18 +348,16 @@ pub fn unwrap_print<T>(res: ResResult<T>, file_contents: &String, type_handler: 
         }
     }
 }
-pub fn print_err(err: ResError, file_contents: &String, type_handler: &TypeHandler) {
-    if let Some(pos) = err.position {
-        print!("{:?} at {}:", err.severity, pos);
+
+pub fn print_err<E: CrustError>(err: E, file_contents: &String, type_handler: &TypeHandler) {
+    if let Some(pos) = err.position() {
+        print!("{:?} at {}:", err.severity(), pos);
     } else {
-        print!("{:?}:", err.severity);
+        print!("{:?}:", err.severity());
     }
-    if let Ok(s) = err.kind.with_handlers(type_handler, err.position) {
-        println!(" {}", s.bold());
-    } else {
-        println!(" {}", format!("{:?}", err.kind).bold());
-    }
-    if let Some(pos) = err.position {
+    let s = err.to_string(type_handler);
+    println!(" {}", s.bold());
+    if let Some(pos) = err.position() {
         let lines: Vec<&str> = file_contents.lines().collect();
         let start = (pos.from.0 as isize - 2).max(0) as usize;
         let end = (pos.to.0 + 1).min(lines.len());
@@ -116,22 +403,12 @@ pub enum ResErrorKind {
     UnknownFunction(String),
     UnknownField(String, String),
     TypeMismatch(TypeID, TypeID),
-    ExpectedNumerical(TypeID),
     ExpectedVariable(String, FuncID),
     ExpectedFunction(String, SymbolID),
     NoTypeInfo(TypeID, TypeID),
     NotInferableNode,
     NotInferableStmt,
-    ExpectedInitializerList,
-    ExpectedTypeIdentifier,
-    ExpectedIdentifier,
-    ExpectedExpression,
     ExpectedStruct,
-    UnexpectedEOF,
-    UnexpectedBreak(LoopContext),
-    UnescapedParenthesis,
-    TokenToOperator(TokenType),
-    ExpectedSemicolon(Token),
     ExpectedElse(TypeID),
     FieldNotFound(String, TypeID),
     SlotNotFound(SlotID),
@@ -145,57 +422,17 @@ pub enum ResErrorKind {
     ExpectedReturnValue(TypeID),
     ExpectedNonArray(TypeID),
     ExpectedArray(TypeID),
-    ExpectedSeparator(Token),
 }
 
 impl ResErrorKind {
-    fn with_handlers(&self, th: &TypeHandler, pos: Option<Position>) -> ResResult<String> {
+    fn with_handlers(&self, th: &TypeHandler, pos: Option<Position>) -> CrustResult<String, ResError> {
         Ok(match self {
             Self::UnknownType(ident) => format!("cannot find type {} in this scope", ident),
-            Self::UnknownVariable(ident) => {
-                format!("cannot find variable {} in this scope", ident)
-            }
             Self::UnknownField(ident, struc) => {
                 format!("cannot find field {} in this struct {}", ident, struc)
             }
             Self::UnknownFunction(ident) => {
                 format!("cannot find function {} in this scope", ident)
-            }
-            Self::TypeMismatch(exp, got) => format!(
-                "expected type {}, got {}",
-                th.get(exp, pos)?.identifier.blue(),
-                th.get(got, pos)?.identifier.blue()
-            ),
-            Self::ExpectedNonArray(exp) => format!(
-                "expected type {}, got array constructor",
-                th.get(exp, pos)?.identifier.blue(),
-            ),
-            Self::ExpectedArray(exp) => format!(
-                "expected array, got {}",
-                th.get(exp, pos)?.identifier.blue(),
-            ),
-            Self::CantDeref(ty) => format!("cannot dereference type {}", th.get(ty, pos)?.identifier.blue()),
-            Self::FieldNotFound(field, ty) => {
-                format!("field {} not found on type {}", field, th.get(ty, pos)?.identifier.blue())
-            }
-            Self::ExpectedNumerical(got) => format!(
-                "expected numerical type, got {}",
-                th.get(got, pos)?.identifier.blue()
-            ),
-            Self::ExpectedVariable(ident, id) => {
-                format!("expected variable {}, found function with {:?}", ident, id)
-            }
-            Self::ExpectedFunction(ident, id) => {
-                format!("expected function {}, found variable with {:?}", ident, id)
-            }
-            Self::NoTypeInfo(t1, t2) => {
-                format!("not possible to infer types between {:?} and {:?}", t1, t2)
-            }
-            Self::ExpectedElse(t) => {
-                format!("expected else, then block has type {}", th.get(t, pos)?.identifier.blue())
-            }
-            Self::ExpectedReturnValue(t) => {
-                format!("expected to return a value of type {}", th.get(t, pos)?.identifier.blue())
             }
             el => format!("{:?}", el),
         })
@@ -205,18 +442,12 @@ impl ResErrorKind {
 impl Debug for ResErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnknownType(ident) => write!(f, "cannot find type {} in this scope", ident),
             Self::UnknownVariable(ident) => {
                 write!(f, "cannot find variable {} in this scope", ident)
             }
             Self::UnknownField(ident, struc) => {
                 write!(f, "cannot find field {} in this struct {}", ident, struc)
             }
-            Self::UnknownFunction(ident) => {
-                write!(f, "cannot find function {} in this scope", ident)
-            }
-            Self::TypeMismatch(exp, got) => write!(f, "expected type {:?}, got {:?}", exp, got),
-            Self::ExpectedNumerical(got) => write!(f, "expected numerical type, got {:?}", got),
             Self::ExpectedVariable(ident, id) => write!(
                 f,
                 "expected variable {}, found function with {:?}",
@@ -232,62 +463,14 @@ impl Debug for ResErrorKind {
                 "not possible to infer types between {:?} and {:?}",
                 t1, t2
             ),
-            Self::NotInferableNode => {
-                write!(f, "expression cant be infered")
-            }
-            Self::NotInferableStmt => {
-                write!(f, "statement cant be infered")
-            }
-            Self::ExpectedInitializerList => {
-                write!(f, "expected initializer list")
-            }
-            Self::ExpectedTypeIdentifier => {
-                write!(f, "expected type identifier")
-            }
-            Self::ExpectedIdentifier => {
-                write!(f, "expected identifier")
-            }
-            Self::UnexpectedEOF => {
-                write!(f, "unexpected end of file")
-            }
-            Self::UnescapedParenthesis => {
-                write!(f, "unescaped parenthesis")
-            }
-            Self::ExpectedExpression => {
-                write!(f, "expected expression")
-            }
-            Self::TokenToOperator(token) => {
-                write!(f, "cant convert token {:?} to operator", token)
-            }
-            Self::ExpectedSemicolon(token) => {
-                write!(f, "expected semicolon, got {}", token.raw)
-            }
-            Self::ExpectedStruct => {
-                write!(f, "expected struct")
-            }
-            Self::ExpectedElse(_) => {
-                write!(f, "expected else if then block is open")
-            }
-            Self::UnexpectedBreak(ctx) => {
-                write!(f, "cant break with value in a {:?} loop", ctx)
-            },
             Self::FieldNotFound(field, ty) => {
                 write!(f, "field {} not found on type {:?}", field, ty)
             }
             Self::SlotNotFound(slot) => {
                 write!(f, "slot {:?} not found in stack frame", slot)
             },
-            Self::CantAssignImmutable(sym) => {
-                write!(f, "cant assign to immutable symbol {}", sym.identifier.green())
-            }
             Self::CantDeref(ty) => {
                 write!(f, "cannot dereference type {:?}", ty)
-            }
-            Self::ExpectedPlace(node) => {
-                write!(f, "expected place, got {:?}", node)
-            }
-            Self::ExpectedScalar(node) => {
-                write!(f, "expected scalar value, got {:?}", node)
             }
             Self::ExpectedPlaceSymbol => {
                 write!(f, "expected place for symbol")
@@ -295,21 +478,7 @@ impl Debug for ResErrorKind {
             Self::ControlFlowExited => {
                 write!(f, "control flow has exited!")
             },
-            Self::Unreachable => {
-                write!(f, "statement is unreachable")
-            },
-            Self::ExpectedReturnValue(_) => {
-                write!(f, "expected return value")
-            },
-            Self::ExpectedNonArray(_) => {
-                write!(f, "expected non array type, got array constructor")
-            },
-            Self::ExpectedArray(_) => {
-                write!(f, "expected array type")
-            },
-            Self::ExpectedSeparator(got) => {
-                write!(f, "expected separator, got {}", got)
-            }
+            _ => Ok(())
         }
     }
 }
@@ -401,7 +570,11 @@ impl<K: Eq + Hash + Clone + Debug> Setter<K> {
     }
 
     pub fn is_used(&self, key: &K) -> bool {
-        self.used[key]
+        self.used.get(key).unwrap_or(&false).clone()
+    }
+
+    pub fn get_used(&self) -> Vec<K> {
+        self.used.iter().filter(|(_, v)| **v).map(|(k, _)| k.clone()).collect()
     }
 
 }

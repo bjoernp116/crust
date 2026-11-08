@@ -16,12 +16,7 @@ impl Display for ValueID {
 
 
 use crate::{
-    asm::Register,
-    error::{ResError, ResErrorKind, Setter, Severity},
-    optimization::ValueInfo,
-    ssa::{Place, PlaceKind, SlotID, SlotTable, StackFrame, ValueID},
-    symbols::SymbolID,
-    types::{TypeHandler, TypeID},
+    asm::Register, error::{ResError, ResErrorKind, Setter, Severity}, optimization::ValueInfo, ssa::places::{SlotID, SlotTable, StackFrame}, symbols::SymbolID, types::{TypeHandler, TypeID}
 };
 
 #[derive(Debug)]
@@ -91,6 +86,10 @@ impl Locator {
         }
     }
 
+    pub fn allocated_args(&self) -> Vec<Register> {
+        self.arg.get_used()
+    }
+
     pub fn drop(&mut self, value_id: ValueID) {
         for v in self.bindings.values() {
             let value = self.get(&value_id);
@@ -124,12 +123,15 @@ impl Locator {
             } else {
                 if let Some(reg) = set.first() {
                     self.arg.use_key(&reg);
-                    println!("{value_id}: arg {:?}", reg);
+                    //println!("{value_id}: arg {:?}", reg);
                     ValueLocation::Register(reg)
                 } else {
                     if self.gpr.left() > 0 {
-                        let reg = self.gpr.get_unused().unwrap();
-                        println!("{value_id}: gpr {:?}", reg);
+                        let mut reg = self.gpr.get_unused().unwrap();
+                        while self.arg.is_used(&reg) {
+                            reg = self.gpr.get_unused().unwrap();
+                        }
+                        //println!("{value_id}: gpr {:?}", reg);
                         ValueLocation::Register(reg)
                     } else {
                         ValueLocation::Spill(slots.new_temp(typeid).clone())
@@ -237,46 +239,6 @@ impl Value {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct StackLocation {
-    pub offset: usize,
-    pub size: usize,
-    pub pointer: bool,
-    pub type_id: TypeID,
-}
-
-impl StackLocation {
-    pub fn index(&self, rhs: &StackLocation) -> StackLocation {
-        StackLocation {
-            offset: self.offset + rhs.offset,
-            size: rhs.size,
-            pointer: self.pointer,
-            type_id: self.type_id,
-        }
-    }
-    pub fn new(type_id: TypeID, offset: usize, size: usize) -> StackLocation {
-        StackLocation {
-            offset,
-            size,
-            pointer: false,
-            type_id,
-        }
-    }
-}
-
-impl Display for StackLocation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let size = match self.size {
-            1 => "byte ptr",
-            2 => "word ptr",
-            4 => "dword ptr",
-            8 => "qword ptr",
-            _ => "",
-        };
-        write!(f, "{}[rbp - {:#x}]", size, self.offset)
-    }
-}
-
 #[derive(Clone)]
 pub struct RegisterSet {
     registers: HashSet<Register>,
@@ -353,6 +315,3 @@ impl Debug for RegisterSet {
         write!(f, "{:?}", registers)
     }
 }
-
-
-

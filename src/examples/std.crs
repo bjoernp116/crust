@@ -1,5 +1,3 @@
-
-
 struct Allocator {
     start: usize,
     current: usize,

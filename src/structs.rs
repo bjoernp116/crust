@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    error::{ResError, ResErrorKind, ResResult}, lexer::Position, locations::StackLocation, parser::TypeSyntax, ssa::{StackFrame, align_up}, types::{TypeHandler, TypeID}
+    error::{ResError, ResErrorKind, TypeError, TypeErrorKind, TypeResult}, lexer::Position, parser::TypeSyntax, ssa::{StackLocation, align_up}, types::{TypeHandler, TypeID}
 };
 
 #[derive(Debug, Clone)]
@@ -27,11 +27,10 @@ impl Struct {
         self.bindings.insert(ident, id);
         id
     }
-    pub fn lookup(&self, ident: &String, pos: Option<Position>) -> ResResult<FieldID> {
-        self.bindings.get(ident).map(|f| f.clone()).ok_or(ResError {
-            kind: ResErrorKind::UnknownField(ident.clone(), self.identifier.clone()),
+    pub fn lookup(&self, ident: &String, pos: Option<Position>) -> TypeResult<FieldID> {
+        self.bindings.get(ident).map(|f| f.clone()).ok_or(TypeError {
+            kind: TypeErrorKind::UnknownField(ident.clone(), self.identifier.clone()),
             position: pos,
-            severity: crate::error::Severity::Error,
         })
     }
     pub fn get_type(&self, field_id: FieldID) -> TypeID {

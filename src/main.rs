@@ -4,7 +4,6 @@ mod asm;
 mod structs;
 mod error;
 mod functions;
-mod locations;
 mod lexer;
 mod parser;
 mod ssa;
@@ -14,11 +13,12 @@ use anyhow::anyhow;
 use clap::{Parser, ValueEnum};
 //use compiler::Compiler;
 use std::io::Write;
+use std::println;
 use std::{fs::read_to_string, path::PathBuf};
 
 use crate::asm::AsmWriter;
 use crate::config::get_config;
-use crate::error::{print_err, unwrap_print};
+use crate::error::{print_err, unwrap_any, unwrap_print};
 use crate::optimization::FunctionAnalysis;
 use crate::ssa::{SSA, ValueID};
 use crate::types::{TypeHandler, Typer};
@@ -144,7 +144,7 @@ fn main() -> anyhow::Result<()> {
             }
 
             let mut tables = typer.tables(type_handler, file_contents);
-            let ssa = unwrap_print(SSA::new(typed_ast, &mut tables, ), &tables.file_contents, &tables.type_handler);
+            let ssa = unwrap_any(SSA::new(typed_ast, &mut tables, ), &tables.file_contents, &tables.type_handler);
             println!("{:#?}", tables.type_handler);
             println!("{:#?}", ssa);
         }
@@ -166,8 +166,9 @@ fn main() -> anyhow::Result<()> {
             }
 
             let mut tables = typer.tables(type_handler, file_contents);
-            let mut ssa = unwrap_print(SSA::new(typed_ast, &mut tables, ), &tables.file_contents, &tables.type_handler);
-            let analysis = FunctionAnalysis::analyze(&ssa.functions[0], &tables);
+            let mut ssa = unwrap_any(SSA::new(typed_ast, &mut tables, ), &tables.file_contents, &tables.type_handler);
+            println!("{}", ssa.functions.len());
+            let analysis = FunctionAnalysis::analyze(&ssa.functions[12], &tables);
             println!("{:#?}", analysis);
             for function in &mut ssa.functions {
                 let mut analysis = FunctionAnalysis::analyze(&function, &tables);
@@ -176,8 +177,8 @@ fn main() -> anyhow::Result<()> {
                 }
                 analysis.allocate(function);
             }
-            println!("{:#?}", ssa.functions[0]);
-            println!("{:#?}", analysis.value_info[&ValueID(60)]);
+            //println!("{:#?}", ssa.functions[0]);
+            //println!("{:#?}", analysis.value_info[&ValueID(60)]);
             std::process::exit(0);
         }
 
@@ -199,7 +200,7 @@ fn main() -> anyhow::Result<()> {
             }
 
             let mut tables = typer.tables(type_handler, file_contents);
-            let mut ssa = unwrap_print(SSA::new(typed_ast, &mut tables, ), &tables.file_contents, &tables.type_handler);
+            let mut ssa = unwrap_any(SSA::new(typed_ast, &mut tables, ), &tables.file_contents, &tables.type_handler);
             for function in &mut ssa.functions {
                 let mut analysis = FunctionAnalysis::analyze(&function, &tables);
                 for _ in 0..10 {
@@ -233,7 +234,7 @@ fn main() -> anyhow::Result<()> {
             }
 
             let mut tables = typer.tables(type_handler, file_contents);
-            let mut ssa = unwrap_print(SSA::new(typed_ast, &mut tables, ), &tables.file_contents, &tables.type_handler);
+            let mut ssa = unwrap_any(SSA::new(typed_ast, &mut tables, ), &tables.file_contents, &tables.type_handler);
             for function in &mut ssa.functions {
                 let mut analysis = FunctionAnalysis::analyze(&function, &tables);
                 for _ in 0..10 {

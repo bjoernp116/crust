@@ -1,13 +1,10 @@
-use std::{any::Any, collections::HashMap, fmt::Display};
+use core::panic;
+use std::{any::Any, collections::HashMap, fmt::Display, todo, unreachable, write};
+
+use colored::Colorize;
 
 use crate::{
-    error::{ResError, ResErrorKind, ResResult, Severity, print_err, unwrap_print},
-    functions::{FuncID, FuncSignature, FuncTable},
-    lexer::Position,
-    parser::{BinaryOperator, Block, Litteral, Node, Statement, TypeSyntax, UnaryOperator},
-    ssa::{Place, PlaceKind, SlotTable},
-    structs::{FieldID, StructID, StructTable},
-    symbols::{Binding, ScopeTable, Symbol, SymbolID, SymbolTable},
+    error::{Severity, TypeError, TypeErrorKind, TypeResult, print_err, unwrap_print, CrustError}, functions::{FuncID, FuncSignature, FuncTable}, lexer::Position, parser::{BinaryOperator, Block, Litteral, Node, Statement, TypeSyntax, UnaryOperator}, ssa::{Place, PlaceKind, SlotTable}, structs::{FieldID, StructID, StructTable}, symbols::{Binding, ScopeTable, Symbol, SymbolID, SymbolTable},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -47,11 +44,11 @@ impl TypeID {
     }
 }
 
-pub fn pick_infer(t1: InferedType, t2: InferedType, pos: Position) -> ResResult<InferedType> {
+pub fn pick_infer(t1: InferedType, t2: InferedType, pos: Position) -> TypeResult<InferedType> {
     match (t1.strong, t2.strong, t1.typeid == t2.typeid) {
         (true, true, true) => Ok(t1),
-        (true, true, false) => Err(ResError::new_err(
-            ResErrorKind::TypeMismatch(t1.typeid, t2.typeid),
+        (true, true, false) => Err(TypeError::new_err(
+            TypeErrorKind::TypeMismatch(t1.typeid, t2.typeid),
             pos,
         )),
         (false, true, _) => Ok(t2),
@@ -68,7 +65,7 @@ pub struct Type {
 }
 
 impl Type {
-    pub fn syntax(&self, th: &TypeHandler) -> ResResult<TypeSyntax> {
+    pub fn syntax(&self, th: &TypeHandler) -> TypeResult<TypeSyntax> {
         match self.kind {
             TypeKind::Primitive | TypeKind::Structure(_) => {
                 Ok(TypeSyntax::Raw(self.identifier.clone()))
@@ -193,19 +190,19 @@ impl TypeHandler {
         handler
     }
 
-    pub fn inner_struct(&self, id: &TypeID, pos: Position) -> ResResult<StructID> {
+    pub fn inner_struct(&self, id: &TypeID, pos: Position) -> TypeResult<StructID> {
         let base_type = self.get(id, Some(pos))?;
         match base_type.kind {
             TypeKind::Structure(struct_id) => Ok(struct_id),
             TypeKind::Reference(type_id) => self.inner_struct(&type_id, pos),
             TypeKind::Primitive => {
-                return Err(ResError::new_err(ResErrorKind::ExpectedStruct, pos));
+                return Err(TypeError::new_err(TypeErrorKind::ExpectedStruct, pos));
             }
             TypeKind::Array(type_id, _) => self.inner_struct(&type_id, pos),
         }
     }
 
-    pub fn is_scalar(&self, id: &TypeID) -> ResResult<bool> {
+    pub fn is_scalar(&self, id: &TypeID) -> TypeResult<bool> {
         let ty = self.get(id, None)?;
         match ty.kind {
             TypeKind::Primitive | TypeKind::Reference(_) => Ok(ty.size <= 8),
@@ -213,19 +210,17 @@ impl TypeHandler {
         }
     }
 
-    pub fn get(&self, id: &TypeID, pos: Option<Position>) -> ResResult<&Type> {
-        self.types.get(id).ok_or(ResError {
-            kind: ResErrorKind::UnknownType(format!("{:?}", id)),
+    pub fn get(&self, id: &TypeID, pos: Option<Position>) -> TypeResult<&Type> {
+        self.types.get(id).ok_or(TypeError {
+            kind: TypeErrorKind::UnknownType(format!("{:?}", id)),
             position: pos,
-            severity: Severity::Error,
         })
     }
 
-    pub fn get_mut(&mut self, id: &TypeID, pos: Option<Position>) -> ResResult<&mut Type> {
-        self.types.get_mut(id).ok_or(ResError {
-            kind: ResErrorKind::UnknownType(format!("{:?}", id)),
+    pub fn get_mut(&mut self, id: &TypeID, pos: Option<Position>) -> TypeResult<&mut Type> {
+        self.types.get_mut(id).ok_or(TypeError {
+            kind: TypeErrorKind::UnknownType(format!("{:?}", id)),
             position: pos,
-            severity: Severity::Error,
         })
     }
 
@@ -245,7 +240,7 @@ impl TypeHandler {
                 TypeSyntax::Reference { mutable, pointee } => {
                     let pointee_id = self.lookup_or_define(*pointee.clone()).unwrap().clone();
                     let ref_id = TypeID(self.types.len());
-                    let pointee_type = self.get(&pointee_id, None).unwrap();
+                    let pointee_type = self.get(&pointee_id, None).ok()?;
                     let ref_type = Type {
                         identifier: format!("&{}", pointee_type.identifier),
                         size: 8,
@@ -264,7 +259,7 @@ impl TypeHandler {
                 TypeSyntax::Array { element, length } => {
                     let element_id = self.lookup_or_define(*element.clone()).unwrap().clone();
                     let array_id = TypeID(self.types.len());
-                    let element_type = self.get(&element_id, None).unwrap();
+                    let element_type = self.get(&element_id, None).ok()?;
                     let array_type = Type {
                         identifier: format!("[{}; {}]", element_type.identifier, length),
                         size: element_type.size * length,
@@ -294,6 +289,14 @@ impl TypeHandler {
         let raw = TypeSyntax::Raw(ty.identifier);
         self.bindings.insert(raw.clone(), id);
         id
+    }
+
+    pub fn err_string(&self, id: &TypeID) -> String {
+        if let Some(t) = self.types.get(id) {
+            format!("{}", t.identifier.blue())
+        } else {
+            format!("{:?}", id)
+        }
     }
 }
 
@@ -366,7 +369,7 @@ impl TypedBlock {
         }
     }
 
-    pub fn break_type(&self, loop_ctx: &LoopContext) -> ResResult<InferedType> {
+    pub fn break_type(&self, loop_ctx: &LoopContext) -> TypeResult<InferedType> {
         if let LoopContext::Loop(loop_type) = loop_ctx {
             let tail_type = self.infered_type();
             pick_infer(loop_type.clone(), tail_type, Position::new(0, 0, 0, 0))
@@ -562,10 +565,10 @@ pub struct InferedType {
 }
 
 impl InferedType {
-    pub fn assert(&self, pos: Position) -> ResResult<()> {
+    pub fn assert(&self, pos: Position) -> TypeResult<()> {
         if !self.strong && self.typeid == TypeID::VOID {
             println!("{:#?}", self);
-            Err(ResError::new_err(ResErrorKind::NotInferableNode, pos))
+            Err(TypeError::new_err(TypeErrorKind::NotInferableNode, pos))
         } else {
             Ok(())
         }
@@ -606,7 +609,7 @@ impl Typer {
         stmts: Vec<Statement>,
         type_handler: &mut TypeHandler,
         file_contents: &String,
-    ) -> ResResult<Vec<TypedStatement>> {
+    ) -> TypeResult<Vec<TypedStatement>> {
         // TODO: Type Declerations here!
         self.collect_signatures(&stmts, type_handler);
 
@@ -615,7 +618,7 @@ impl Typer {
             match stmt {
                 Statement::Struct(identifier, args) => {
                     let type_id = type_handler.lookup(TypeSyntax::Raw(identifier)).unwrap();
-                    let struc = type_handler.get(&type_id, None).unwrap();
+                    let struc = type_handler.get(&type_id, None)?;
                     if let TypeKind::Structure(id) = struc.kind {
                         self.structs.define_fields(id, args, type_handler);
                     }
@@ -664,8 +667,8 @@ impl Typer {
                         };
                         resolved.push(function);
                     } else {
-                        return Err(ResError::new_err(
-                            ResErrorKind::UnknownFunction(identifier),
+                        return Err(TypeError::new_err(
+                            TypeErrorKind::UnknownFunction(identifier),
                             Position::new(0, 0, 0, 0),
                         ));
                     }
@@ -681,7 +684,7 @@ impl Typer {
         &mut self,
         stmt: Statement,
         type_handler: &mut TypeHandler,
-    ) -> ResResult<TypedStatement> {
+    ) -> TypeResult<TypedStatement> {
         match stmt {
             Statement::VarDecl(ident, ty, mutable, node) => {
                 let (typed_child, exp) = if let Some(type_ident) = ty.clone() {
@@ -741,8 +744,8 @@ impl Typer {
                                 Some(typed_node),
                             ))
                         } else {
-                            Err(ResError::new_err(
-                                ResErrorKind::UnexpectedBreak(loop_ctx.clone()),
+                            Err(TypeError::new_err(
+                                TypeErrorKind::UnexpectedBreak(loop_ctx.clone()),
                                 node.position(),
                             ))
                         }
@@ -772,7 +775,7 @@ impl Typer {
         block: Block,
         type_handler: &mut TypeHandler,
         expected: &InferedType,
-    ) -> ResResult<TypedBlock> {
+    ) -> TypeResult<TypedBlock> {
         let mut stmts = Vec::new();
         for stmt in block.stmts {
             stmts.push(self.resolve_stmt(stmt, type_handler)?);
@@ -800,7 +803,7 @@ impl Typer {
         node: Node,
         type_handler: &mut TypeHandler,
         expected: &InferedType,
-    ) -> ResResult<TypedNode> {
+    ) -> TypeResult<TypedNode> {
         let mut node = match node {
             Node::Litteral(lit, pos) => {
                 if expected.strong {
@@ -833,8 +836,8 @@ impl Typer {
                         }
                         TypedNode::ArrayConstructor(expected.typeid, typed_nodes, pos)
                     } else {
-                        return Err(ResError::new_err(
-                            ResErrorKind::ExpectedNonArray(expected.typeid),
+                        return Err(TypeError::new_err(
+                            TypeErrorKind::ExpectedNonArray(expected.typeid),
                             pos,
                         ));
                     }
@@ -924,8 +927,8 @@ impl Typer {
                         pos,
                     ),
                     _ => {
-                        return Err(ResError::new_err(
-                            ResErrorKind::ExpectedArray(typed_base.infered_type().typeid),
+                        return Err(TypeError::new_err(
+                            TypeErrorKind::ExpectedArray(typed_base.infered_type().typeid),
                             pos,
                         ));
                     }
@@ -965,8 +968,8 @@ impl Typer {
                         TypedNode::Deref(parent.strong(), Box::new(typed_node), pos)
                     }
                     _ => {
-                        return Err(ResError::new_err(
-                            ResErrorKind::CantDeref(node_type_id),
+                        return Err(TypeError::new_err(
+                            TypeErrorKind::CantDeref(node_type_id),
                             pos,
                         ));
                     }
@@ -977,7 +980,7 @@ impl Typer {
                     .lookup(TypeSyntax::Raw(type_ident.clone()))
                     .unwrap();
                 if let TypeKind::Structure(struct_id) =
-                    type_handler.get(&type_id, Some(pos)).unwrap().kind
+                    type_handler.get(&type_id, Some(pos))?.kind
                 {
                     let struc = self.structs.get(struct_id).unwrap();
                     let mut typed_fields = Vec::new();
@@ -990,8 +993,8 @@ impl Typer {
                     }
                     TypedNode::StructConstructor(type_id, typed_fields, pos)
                 } else {
-                    return Err(ResError::new_err(
-                        ResErrorKind::UnknownType(type_ident),
+                    return Err(TypeError::new_err(
+                        TypeErrorKind::UnknownType(type_ident),
                         pos,
                     ));
                 }
@@ -1004,8 +1007,8 @@ impl Typer {
                 TypedNode::Assignment(TypeID::VOID.strong(), assignee, Box::new(child), pos)
             }
             Node::Identifier(ident, pos) => {
-                let binding = self.scopes.lookup(ident.clone()).ok_or(ResError::new_err(
-                    ResErrorKind::UnknownVariable(ident.clone()),
+                let binding = self.scopes.lookup(ident.clone()).ok_or(TypeError::new_err(
+                    TypeErrorKind::UnknownVariable(ident.clone()),
                     pos,
                 ))?;
                 match binding {
@@ -1015,8 +1018,8 @@ impl Typer {
                             && expected.strong
                             && symbol.typeid.typeid != expected.typeid
                         {
-                            return Err(ResError::new_err(
-                                ResErrorKind::TypeMismatch(expected.typeid, symbol.typeid.typeid),
+                            return Err(TypeError::new_err(
+                                TypeErrorKind::TypeMismatch(expected.typeid, symbol.typeid.typeid),
                                 pos,
                             ));
                         }
@@ -1026,16 +1029,16 @@ impl Typer {
                         TypedNode::Identifier(symbol.typeid.clone(), id, pos)
                     }
                     Binding::Function(id) => {
-                        return Err(ResError::new_err(
-                            ResErrorKind::ExpectedVariable(ident, id),
+                        return Err(TypeError::new_err(
+                            TypeErrorKind::ExpectedVariable(ident, id),
                             pos,
                         ));
                     }
                 }
             }
             Node::FuncIdentifier(ident, params, pos) => {
-                let binding = self.scopes.lookup(ident.clone()).ok_or(ResError::new_err(
-                    ResErrorKind::UnknownFunction(ident.clone()),
+                let binding = self.scopes.lookup(ident.clone()).ok_or(TypeError::new_err(
+                    TypeErrorKind::UnknownFunction(ident.clone()),
                     pos,
                 ))?;
                 match binding {
@@ -1050,8 +1053,8 @@ impl Typer {
                         TypedNode::FuncIdentifier(signature.ret, id, parsed_args, pos)
                     }
                     Binding::Variable(id) => {
-                        return Err(ResError::new_err(
-                            ResErrorKind::ExpectedFunction(ident, id),
+                        return Err(TypeError::new_err(
+                            TypeErrorKind::ExpectedFunction(ident, id),
                             pos,
                         ));
                     }
@@ -1063,8 +1066,8 @@ impl Typer {
                     && expected.strong
                     && inner.infered_type().typeid != expected.typeid
                 {
-                    return Err(ResError::new_err(
-                        ResErrorKind::TypeMismatch(expected.typeid, inner.infered_type().typeid),
+                    return Err(TypeError::new_err(
+                        TypeErrorKind::TypeMismatch(expected.typeid, inner.infered_type().typeid),
                         pos,
                     ));
                 }
@@ -1076,8 +1079,8 @@ impl Typer {
                     && expected.strong
                     && inner.infered_type().typeid != expected.typeid
                 {
-                    return Err(ResError::new_err(
-                        ResErrorKind::TypeMismatch(expected.typeid, inner.infered_type().typeid),
+                    return Err(TypeError::new_err(
+                        TypeErrorKind::TypeMismatch(expected.typeid, inner.infered_type().typeid),
                         inner.position(),
                     ));
                 }
@@ -1107,8 +1110,8 @@ impl Typer {
                 if type_left.typeid != type_right.typeid {
                     match (type_left.strong, type_right.strong) {
                         (true, true) => {
-                            return Err(ResError::new_err(
-                                ResErrorKind::TypeMismatch(type_left.typeid, type_right.typeid),
+                            return Err(TypeError::new_err(
+                                TypeErrorKind::TypeMismatch(type_left.typeid, type_right.typeid),
                                 position,
                             ));
                         }
@@ -1116,8 +1119,8 @@ impl Typer {
                         (false, true) => self.correct_node(&mut inner_left, &type_right.typeid)?,
                         (false, false) => {
                             println!("left: {:?}, right: {:?}", inner_left, inner_right);
-                            return Err(ResError::new_err(
-                                ResErrorKind::NoTypeInfo(type_left.typeid, type_right.typeid),
+                            return Err(TypeError::new_err(
+                                TypeErrorKind::NoTypeInfo(type_left.typeid, type_right.typeid),
                                 position,
                             ));
                         }
@@ -1150,19 +1153,19 @@ impl Typer {
         pos: Position,
         expected: InferedType,
         type_handler: &mut TypeHandler,
-    ) -> ResResult<Assignee> {
+    ) -> TypeResult<Assignee> {
         match node {
             Node::Identifier(ident, _) => {
-                let binding = self.scopes.lookup(ident.clone()).ok_or(ResError::new_err(
-                    ResErrorKind::UnknownVariable(ident.clone()),
+                let binding = self.scopes.lookup(ident.clone()).ok_or(TypeError::new_err(
+                    TypeErrorKind::UnknownVariable(ident.clone()),
                     pos,
                 ))?;
                 match binding {
                     Binding::Variable(id) => {
                         let symbol: &mut Symbol = self.symbols.get_mut(id);
                         if !symbol.mutable {
-                            return Err(ResError::new_err(
-                                ResErrorKind::CantAssignImmutable(symbol.clone()),
+                            return Err(TypeError::new_err(
+                                TypeErrorKind::CantAssignImmutable(symbol.clone()),
                                 pos,
                             ));
                         }
@@ -1170,16 +1173,16 @@ impl Typer {
                             symbol.typeid = expected;
                         }
                         if symbol.typeid.typeid != expected.typeid && expected.strong {
-                            return Err(ResError::new_err(
-                                ResErrorKind::TypeMismatch(symbol.typeid.typeid, expected.typeid),
+                            return Err(TypeError::new_err(
+                                TypeErrorKind::TypeMismatch(symbol.typeid.typeid, expected.typeid),
                                 pos,
                             ));
                         }
                         Ok(Assignee::Symbol(id))
                     }
                     Binding::Function(id) => {
-                        return Err(ResError::new_err(
-                            ResErrorKind::ExpectedVariable(ident, id),
+                        return Err(TypeError::new_err(
+                            TypeErrorKind::ExpectedVariable(ident, id),
                             pos,
                         ));
                     }
@@ -1200,7 +1203,7 @@ impl Typer {
         }
     }
 
-    pub fn correct_stmt(&mut self, mut stmt: &mut TypedStatement) -> ResResult<()> {
+    pub fn correct_stmt(&mut self, mut stmt: &mut TypedStatement) -> TypeResult<()> {
         match &mut stmt {
             TypedStatement::VarDecl(_, id, n) => {
                 let expected = self.symbols.get(&id).typeid.typeid;
@@ -1217,7 +1220,7 @@ impl Typer {
         &mut self,
         mut block: &mut TypedBlock,
         expected: &TypeID,
-    ) -> ResResult<()> {
+    ) -> TypeResult<()> {
         for stmt in &mut block.stmts {
             self.correct_stmt(stmt)?;
         }
@@ -1227,12 +1230,12 @@ impl Typer {
         Ok(())
     }
 
-    pub fn correct_node(&mut self, mut node: &mut TypedNode, expected: &TypeID) -> ResResult<()> {
+    pub fn correct_node(&mut self, mut node: &mut TypedNode, expected: &TypeID) -> TypeResult<()> {
         match &mut node {
             TypedNode::Identifier(t, _, pos) => {
                 if t.strong && t.typeid != expected.clone() {
-                    return Err(ResError::new_err(
-                        ResErrorKind::TypeMismatch(expected.clone(), t.typeid),
+                    return Err(TypeError::new_err(
+                        TypeErrorKind::TypeMismatch(expected.clone(), t.typeid),
                         pos.clone(),
                     ));
                 }
@@ -1248,8 +1251,8 @@ impl Typer {
             TypedNode::Deref(_, _, _) => {}
             TypedNode::Litteral(t, _, pos) => {
                 if t.strong && t.typeid != expected.clone() {
-                    return Err(ResError::new_err(
-                        ResErrorKind::TypeMismatch(expected.clone(), t.typeid),
+                    return Err(TypeError::new_err(
+                        TypeErrorKind::TypeMismatch(expected.clone(), t.typeid),
                         pos.clone(),
                     ));
                 }
@@ -1258,8 +1261,8 @@ impl Typer {
             }
             TypedNode::Block(ty, block) => {
                 if ty.strong && ty.typeid != expected.clone() {
-                    return Err(ResError::new_err(
-                        ResErrorKind::TypeMismatch(expected.clone(), ty.typeid),
+                    return Err(TypeError::new_err(
+                        TypeErrorKind::TypeMismatch(expected.clone(), ty.typeid),
                         block.position.clone(),
                     ));
                 }
@@ -1275,8 +1278,8 @@ impl Typer {
             }
             TypedNode::Loop(ty, block) => {
                 if ty.strong && ty.typeid != expected.clone() {
-                    return Err(ResError::new_err(
-                        ResErrorKind::TypeMismatch(expected.clone(), ty.typeid),
+                    return Err(TypeError::new_err(
+                        TypeErrorKind::TypeMismatch(expected.clone(), ty.typeid),
                         block.position.clone(),
                     ));
                 }
@@ -1299,8 +1302,8 @@ impl Typer {
             }
             TypedNode::Unary(ty, _, child, pos) => {
                 if ty.strong && ty.typeid != expected.clone() {
-                    return Err(ResError::new_err(
-                        ResErrorKind::TypeMismatch(expected.clone(), ty.typeid),
+                    return Err(TypeError::new_err(
+                        TypeErrorKind::TypeMismatch(expected.clone(), ty.typeid),
                         pos.clone(),
                     ));
                 }
@@ -1310,8 +1313,8 @@ impl Typer {
             }
             TypedNode::Parenthesis(ty, child) => {
                 if ty.strong && ty.typeid != expected.clone() {
-                    return Err(ResError::new_err(
-                        ResErrorKind::TypeMismatch(expected.clone(), ty.typeid),
+                    return Err(TypeError::new_err(
+                        TypeErrorKind::TypeMismatch(expected.clone(), ty.typeid),
                         child.position(),
                     ));
                 }
@@ -1327,8 +1330,8 @@ impl Typer {
                 position,
             } => {
                 if typeid.strong && typeid.typeid != expected.clone() {
-                    return Err(ResError::new_err(
-                        ResErrorKind::TypeMismatch(expected.clone(), typeid.typeid),
+                    return Err(TypeError::new_err(
+                        TypeErrorKind::TypeMismatch(expected.clone(), typeid.typeid),
                         position.clone(),
                     ));
                 }
@@ -1350,8 +1353,8 @@ impl Typer {
                             self.correct_node(left, &right.infered_type().typeid)?;
                             self.correct_node(right, &left.infered_type().typeid)?;
                         } else {
-                            return Err(ResError::new_warn(
-                                ResErrorKind::NoTypeInfo(
+                            return Err(TypeError::new_err(
+                                TypeErrorKind::NoTypeInfo(
                                     right.infered_type().typeid,
                                     left.infered_type().typeid,
                                 ),
@@ -1369,8 +1372,8 @@ impl Typer {
             }
             TypedNode::Assignment(t, _, node, pos) => {
                 if t.strong && t.typeid != expected.clone() {
-                    return Err(ResError::new_err(
-                        ResErrorKind::TypeMismatch(expected.clone(), t.typeid),
+                    return Err(TypeError::new_err(
+                        TypeErrorKind::TypeMismatch(expected.clone(), t.typeid),
                         pos.clone(),
                     ));
                 }
@@ -1413,11 +1416,12 @@ impl Typer {
                     } else {
                         TypeID::VOID
                     };
-                    let signature = FuncSignature {
-                        identifier: identifier.clone(),
-                        params: typed_args,
-                        ret: typed_ret,
-                    };
+                    let signature = FuncSignature::new(
+                        identifier.clone(),
+                        typed_args,
+                        typed_ret,
+                        &type_handler,
+                    ).unwrap();
 
                     self.define_func(identifier.clone(), signature);
                 }

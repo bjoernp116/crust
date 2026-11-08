@@ -1,11 +1,7 @@
 use std::{collections::VecDeque, fmt::Display};
 
 use crate::{
-    error::{ResError, ResErrorKind, ResResult},
-    lexer::{Position, Token, TokenType},
-    locations::ValueLocation,
-    ssa::{Operation, SlotID, ValueID},
-    types::TypeID,
+    error::{ParserError, ParserErrorKind, ParserResult, CrustError}, lexer::{Position, Token, TokenType}, ssa::{Operation, SlotID, ValueID}, types::TypeID,
 };
 
 #[derive(Clone)]
@@ -340,7 +336,7 @@ impl AstFactory {
     pub fn is(&self, token_type: TokenType) -> bool {
         self.tokens[self.current].token_type == token_type
     }
-    pub fn parse_statements(&mut self) -> ResResult<Vec<Statement>> {
+    pub fn parse_statements(&mut self) -> ParserResult<Vec<Statement>> {
         let mut out: Vec<Statement> = Vec::new();
         while self.current < self.tokens.len() {
             let node = self.parse_statement()?;
@@ -348,9 +344,9 @@ impl AstFactory {
         }
         Ok(out)
     }
-    pub fn parse_statement(&mut self) -> ResResult<Statement> {
+    pub fn parse_statement(&mut self) -> ParserResult<Statement> {
         self.debug("parse_statement");
-        let out: ResResult<Statement> = match self.tokens[self.current].token_type {
+        let out: ParserResult<Statement> = match self.tokens[self.current].token_type {
             TokenType::Return => {
                 self.current += 1;
                 if let TokenType::SemiColon = self.tokens[self.current].token_type {
@@ -405,8 +401,8 @@ impl AstFactory {
                         }
                     }
                 } else {
-                    Err(ResError::new_err(
-                        ResErrorKind::ExpectedIdentifier,
+                    Err(ParserError::new_err(
+                        ParserErrorKind::ExpectedIdentifier,
                         identifier.position(),
                     ))
                 }
@@ -505,8 +501,8 @@ impl AstFactory {
                     match self.tokens[self.current].token_type {
                         TokenType::LeftParen => {}
                         _ => {
-                            return Err(ResError::new_err(
-                                ResErrorKind::ExpectedInitializerList,
+                            return Err(ParserError::new_err(
+                                ParserErrorKind::ExpectedInitializerList,
                                 pos,
                             ));
                         }
@@ -545,8 +541,8 @@ impl AstFactory {
                         body,
                     })
                 } else {
-                    Err(ResError::new_err(
-                        ResErrorKind::ExpectedIdentifier,
+                    Err(ParserError::new_err(
+                        ParserErrorKind::ExpectedIdentifier,
                         identifier_token.position(),
                     ))
                 }
@@ -559,8 +555,8 @@ impl AstFactory {
                     match self.tokens[self.current].token_type {
                         TokenType::LeftBrace => {}
                         _ => {
-                            return Err(ResError::new_err(
-                                ResErrorKind::ExpectedInitializerList,
+                            return Err(ParserError::new_err(
+                                ParserErrorKind::ExpectedInitializerList,
                                 pos,
                             ));
                         }
@@ -585,8 +581,8 @@ impl AstFactory {
                     self.current += 1;
                     Ok(Statement::Struct(ident, args))
                 } else {
-                    Err(ResError::new_err(
-                        ResErrorKind::ExpectedIdentifier,
+                    Err(ParserError::new_err(
+                        ParserErrorKind::ExpectedIdentifier,
                         identifier_token.position(),
                     ))
                 }
@@ -599,7 +595,7 @@ impl AstFactory {
 
         out
     }
-    fn parse_named_argument(&mut self) -> ResResult<(String, TypeSyntax)> {
+    fn parse_named_argument(&mut self) -> ParserResult<(String, TypeSyntax)> {
         self.debug("parse_named_argument");
         let n = self.parse_number()?;
         if let Node::Identifier(identifier, pos) = n {
@@ -611,16 +607,16 @@ impl AstFactory {
                 }
                 Ok((identifier, typename))
             } else {
-                Err(ResError::new_err(ResErrorKind::ExpectedTypeIdentifier, pos))
+                Err(ParserError::new_err(ParserErrorKind::ExpectedTypeIdentifier, pos))
             }
         } else {
-            Err(ResError::new_err(
-                ResErrorKind::ExpectedTypeIdentifier,
+            Err(ParserError::new_err(
+                ParserErrorKind::ExpectedTypeIdentifier,
                 n.position(),
             ))
         }
     }
-    fn parse_assignment(&mut self) -> ResResult<Node> {
+    fn parse_assignment(&mut self) -> ParserResult<Node> {
         self.debug("parse_assignment");
         let identifier: Node = self.parse_or()?;
         while self.current < self.tokens.len() {
@@ -651,8 +647,8 @@ impl AstFactory {
                         return Ok(node);
                     }
                     _ => {
-                        return Err(ResError::new_err(
-                            ResErrorKind::ExpectedIdentifier,
+                        return Err(ParserError::new_err(
+                            ParserErrorKind::ExpectedIdentifier,
                             self.tokens[self.current].position,
                         ));
                     }
@@ -662,7 +658,7 @@ impl AstFactory {
         }
         Ok(identifier)
     }
-    pub fn parse_or(&mut self) -> ResResult<Node> {
+    pub fn parse_or(&mut self) -> ParserResult<Node> {
         self.debug("parse_or");
         let mut node = self.parse_and()?;
         while self.current < self.tokens.len() {
@@ -688,7 +684,7 @@ impl AstFactory {
         Ok(node)
     }
 
-    pub fn parse_type_syntax(&mut self) -> ResResult<TypeSyntax> {
+    pub fn parse_type_syntax(&mut self) -> ParserResult<TypeSyntax> {
         self.debug("parse_type_syntax");
         return match self.tokens[self.current].token_type.clone() {
             TokenType::Reference => {
@@ -714,29 +710,29 @@ impl AstFactory {
                             length: length as usize,
                         })
                     } else {
-                        Err(ResError::new_err(
-                            ResErrorKind::ExpectedNumerical(TypeID::U32),
+                        Err(ParserError::new_err(
+                            ParserErrorKind::ExpectedNumerical(TypeID::U32),
                             self.tokens[self.current].position,
                         ))
                     }
                 } else {
-                    Err(ResError::new_err(
-                        ResErrorKind::ExpectedSemicolon(self.tokens[self.current].clone()),
+                    Err(ParserError::new_err(
+                        ParserErrorKind::ExpectedSemicolon(self.tokens[self.current].clone()),
                         self.tokens[self.current].position,
                     ))
                 }
             }
             _ => {
                 println!("{:?}", self.tokens[self.current].token_type);
-                Err(ResError::new_err(
-                    ResErrorKind::ExpectedIdentifier,
+                Err(ParserError::new_err(
+                    ParserErrorKind::ExpectedIdentifier,
                     self.tokens[self.current].position,
                 ))
             }
         };
     }
 
-    pub fn parse_and(&mut self) -> ResResult<Node> {
+    pub fn parse_and(&mut self) -> ParserResult<Node> {
         self.debug("parse_and");
         let mut node = self.parse_equality()?;
         while self.current < self.tokens.len() {
@@ -761,7 +757,7 @@ impl AstFactory {
         }
         Ok(node)
     }
-    pub fn parse_equality(&mut self) -> ResResult<Node> {
+    pub fn parse_equality(&mut self) -> ParserResult<Node> {
         self.debug("parse_equality");
         let mut node: Node = self.parse_term()?;
         while self.current < self.tokens.len() {
@@ -792,7 +788,7 @@ impl AstFactory {
         Ok(node)
     }
 
-    fn parse_term(&mut self) -> ResResult<Node> {
+    fn parse_term(&mut self) -> ParserResult<Node> {
         self.debug("parse_term");
         let mut node: Node = self.parse_factor()?;
         while self.current < self.tokens.len() {
@@ -818,7 +814,7 @@ impl AstFactory {
         Ok(node)
     }
 
-    fn parse_factor(&mut self) -> ResResult<Node> {
+    fn parse_factor(&mut self) -> ParserResult<Node> {
         self.debug("parse_factor");
         let mut node: Node = self.parse_exponent()?;
         while self.current < self.tokens.len() {
@@ -844,7 +840,7 @@ impl AstFactory {
         Ok(node)
     }
 
-    fn parse_exponent(&mut self) -> ResResult<Node> {
+    fn parse_exponent(&mut self) -> ParserResult<Node> {
         self.debug("parse_exponent");
         let mut node: Node = self.parse_cast()?;
         while self.current < self.tokens.len() {
@@ -870,7 +866,7 @@ impl AstFactory {
         Ok(node)
     }
 
-    fn parse_cast(&mut self) -> ResResult<Node> {
+    fn parse_cast(&mut self) -> ParserResult<Node> {
         self.debug("parse_cast");
         let mut node = self.parse_postfix()?;
         while self.current < self.tokens.len() {
@@ -885,8 +881,8 @@ impl AstFactory {
                         Position::range(node.position(), self.tokens[self.current].position);
                     let identifier = match self.tokens[self.current].token_type.clone() {
                         TokenType::Identifier(ident) => ident,
-                        _ => Err(ResError::new_err(
-                            ResErrorKind::ExpectedTypeIdentifier,
+                        _ => Err(ParserError::new_err(
+                            ParserErrorKind::ExpectedTypeIdentifier,
                             position,
                         ))?,
                     };
@@ -899,11 +895,11 @@ impl AstFactory {
         Ok(node)
     }
 
-    fn parse_primary(&mut self) -> ResResult<Node> {
+    fn parse_primary(&mut self) -> ParserResult<Node> {
         self.debug("parse_primary");
         if self.current >= self.tokens.len() {
-            return Err(ResError::new_err(
-                ResErrorKind::UnexpectedEOF,
+            return Err(ParserError::new_err(
+                ParserErrorKind::UnexpectedEOF,
                 self.tokens.iter().last().unwrap().position,
             ));
         }
@@ -948,7 +944,7 @@ impl AstFactory {
         }
     }
 
-    fn parse_block(&mut self) -> ResResult<Block> {
+    fn parse_block(&mut self) -> ParserResult<Block> {
         self.debug("parse_block");
         let pos1 = self.tokens[self.current].position.clone();
         let mut statements: Vec<Statement> = Vec::new();
@@ -978,8 +974,8 @@ impl AstFactory {
             }
         }
         if self.current >= self.tokens.len() {
-            return Err(ResError::new_err(
-                ResErrorKind::UnexpectedEOF,
+            return Err(ParserError::new_err(
+                ParserErrorKind::UnexpectedEOF,
                 self.tokens.iter().last().unwrap().position,
             ));
         }
@@ -994,7 +990,7 @@ impl AstFactory {
         out
     }
 
-    fn parse_unary(&mut self) -> ResResult<Node> {
+    fn parse_unary(&mut self) -> ParserResult<Node> {
         self.debug("parse_unary");
         let op = self.tokens[self.current].clone();
         self.current += 1;
@@ -1004,7 +1000,7 @@ impl AstFactory {
         Ok(unary)
     }
 
-    fn parse_address(&mut self) -> ResResult<Node> {
+    fn parse_address(&mut self) -> ParserResult<Node> {
         self.debug("parse_address");
         let op = self.tokens[self.current].clone();
         self.current += 1;
@@ -1017,7 +1013,7 @@ impl AstFactory {
         }
     }
 
-    fn parse_postfix(&mut self) -> ResResult<Node> {
+    fn parse_postfix(&mut self) -> ParserResult<Node> {
         self.debug("parse_postfix");
         let mut node = self.parse_primary()?;
         while self.current < self.tokens.len() {
@@ -1028,8 +1024,8 @@ impl AstFactory {
                         if let Node::Identifier(i, pos) = self.parse_number()? {
                             (i, pos)
                         } else {
-                            return Err(ResError::new_err(
-                                ResErrorKind::ExpectedIdentifier,
+                            return Err(ParserError::new_err(
+                                ParserErrorKind::ExpectedIdentifier,
                                 node.position(),
                             ));
                         };
@@ -1043,8 +1039,8 @@ impl AstFactory {
                     if let TokenType::RightBlock = self.tokens[self.current].token_type {
                         self.current += 1;
                     } else {
-                        return Err(ResError::new_err(
-                            ResErrorKind::ExpectedSeparator(self.tokens[self.current].clone()),
+                        return Err(ParserError::new_err(
+                            ParserErrorKind::ExpectedSeparator(self.tokens[self.current].clone()),
                             self.tokens[self.current].position,
                         ));
                     }
@@ -1057,7 +1053,7 @@ impl AstFactory {
         Ok(node)
     }
 
-    fn parse_array_constructor(&mut self) -> ResResult<Node> {
+    fn parse_array_constructor(&mut self) -> ParserResult<Node> {
         self.debug("parse_array_constructor");
         let start_pos = self.tokens[self.current].position;
         self.current += 1;
@@ -1095,7 +1091,7 @@ impl AstFactory {
         ))
     }
 
-    fn parse_paren(&mut self) -> ResResult<Node> {
+    fn parse_paren(&mut self) -> ParserResult<Node> {
         self.debug("parse_paren");
         let mut open_p = 0;
         let mut private_tokens: VecDeque<Token> = VecDeque::new();
@@ -1118,8 +1114,8 @@ impl AstFactory {
             self.current += 1;
         }
         if open_p != 0 {
-            return Err(ResError::new_err(
-                ResErrorKind::UnescapedParenthesis,
+            return Err(ParserError::new_err(
+                ParserErrorKind::UnescapedParenthesis,
                 self.tokens[self.current].position,
             ));
         }
@@ -1131,11 +1127,11 @@ impl AstFactory {
         Ok(Node::Parenthesis(Box::new(node)))
     }
 
-    fn parse_number(&mut self) -> ResResult<Node> {
+    fn parse_number(&mut self) -> ParserResult<Node> {
         self.debug("parse_number");
         if self.current >= self.tokens.len() {
-            return Err(ResError::new_err(
-                ResErrorKind::UnexpectedEOF,
+            return Err(ParserError::new_err(
+                ParserErrorKind::UnexpectedEOF,
                 self.tokens.iter().last().unwrap().position,
             ));
         }
@@ -1170,14 +1166,14 @@ impl AstFactory {
                     _ => Ok(Node::Identifier(i.clone(), position)),
                 }
             }
-            _ => Err(ResError::new_err(
-                ResErrorKind::ExpectedExpression,
+            _ => Err(ParserError::new_err(
+                ParserErrorKind::ExpectedExpression,
                 position,
             )),
         }
     }
 
-    fn parse_func_identifier(&mut self, i: String, position: Position) -> ResResult<Node> {
+    fn parse_func_identifier(&mut self, i: String, position: Position) -> ParserResult<Node> {
         self.debug("parse_func_identifier");
         self.current += 1;
         let mut args = Vec::new();
@@ -1199,7 +1195,7 @@ impl AstFactory {
         }
         Ok(Node::FuncIdentifier(i.clone(), args, position))
     }
-    fn parse_constructor(&mut self, i: String, position: Position) -> ResResult<Node> {
+    fn parse_constructor(&mut self, i: String, position: Position) -> ParserResult<Node> {
         self.debug("parse_constructor");
         self.current += 1;
         let mut idents = Vec::new();
@@ -1219,8 +1215,8 @@ impl AstFactory {
                     if let TokenType::Colon = self.tokens[self.current].token_type {
                         self.current += 1;
                     } else {
-                        return Err(ResError::new_err(
-                            ResErrorKind::ExpectedTypeIdentifier,
+                        return Err(ParserError::new_err(
+                            ParserErrorKind::ExpectedTypeIdentifier,
                             position,
                         ));
                     }
@@ -1229,8 +1225,8 @@ impl AstFactory {
                     self.current += 1;
                 }
                 _ => {
-                    return Err(ResError::new_err(
-                        ResErrorKind::ExpectedIdentifier,
+                    return Err(ParserError::new_err(
+                        ParserErrorKind::ExpectedIdentifier,
                         position,
                     ));
                 }
@@ -1242,27 +1238,27 @@ impl AstFactory {
             position,
         ))
     }
-    fn parse_var_identifier(&mut self) -> ResResult<Node> {
+    fn parse_var_identifier(&mut self) -> ParserResult<Node> {
         self.debug("parse_var_identifier");
         let position = self.tokens[self.current].position.clone();
         if let TokenType::Identifier(i) = self.tokens[self.current].token_type.clone() {
             Ok(Node::Identifier(i, position))
         } else {
-            Err(ResError::new_err(
-                ResErrorKind::ExpectedExpression,
+            Err(ParserError::new_err(
+                ParserErrorKind::ExpectedExpression,
                 position,
             ))
         }
     }
 
-    fn assert_semicolon(&mut self) -> ResResult<()> {
+    fn assert_semicolon(&mut self) -> ParserResult<()> {
         if let Some(token) = self.tokens.get(self.current) {
             if let TokenType::SemiColon = token.token_type {
                 self.current += 1;
                 Ok(())
             } else {
-                Err(ResError::new_err(
-                    ResErrorKind::ExpectedSemicolon(self.tokens[self.current].clone()),
+                Err(ParserError::new_err(
+                    ParserErrorKind::ExpectedSemicolon(self.tokens[self.current].clone()),
                     self.tokens[self.current - 1].position,
                 ))
             }
@@ -1272,13 +1268,13 @@ impl AstFactory {
     }
 
     fn debug(&self, func: &str) {
-        println!("{}:\ttoken = {}", func, self.tokens[self.current]);
+        //println!("{}:\ttoken = {}", func, self.tokens[self.current]);
     }
 }
 
 impl TryFrom<Token> for BinaryOperator {
-    type Error = ResError;
-    fn try_from(token: Token) -> ResResult<BinaryOperator> {
+    type Error = ParserError;
+    fn try_from(token: Token) -> ParserResult<BinaryOperator> {
         match token.token_type {
             TokenType::Plus => Ok(BinaryOperator::Add),
             TokenType::Minus => Ok(BinaryOperator::Sub),
@@ -1294,8 +1290,8 @@ impl TryFrom<Token> for BinaryOperator {
             TokenType::Greater => Ok(BinaryOperator::G),
             TokenType::Or => Ok(BinaryOperator::Or),
             TokenType::And => Ok(BinaryOperator::And),
-            tt => Err(ResError::new_err(
-                ResErrorKind::TokenToOperator(tt),
+            tt => Err(ParserError::new_err(
+                ParserErrorKind::TokenToOperator(tt),
                 token.position,
             )),
         }
@@ -1303,13 +1299,13 @@ impl TryFrom<Token> for BinaryOperator {
 }
 
 impl TryFrom<Token> for UnaryOperator {
-    type Error = ResError;
-    fn try_from(token: Token) -> ResResult<UnaryOperator> {
+    type Error = ParserError;
+    fn try_from(token: Token) -> ParserResult<UnaryOperator> {
         match token.token_type {
             TokenType::Bang => Ok(UnaryOperator::Not),
             TokenType::Minus => Ok(UnaryOperator::Neg),
-            tt => Err(ResError::new_err(
-                ResErrorKind::TokenToOperator(tt),
+            tt => Err(ParserError::new_err(
+                ParserErrorKind::TokenToOperator(tt),
                 token.position,
             )),
         }

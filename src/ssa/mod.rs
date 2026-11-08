@@ -1,6 +1,21 @@
+mod flow;
+mod generator;
 mod operations;
-mod values;
 mod places;
+mod values;
+
+pub use operations::Operation;
+pub use places::Place;
+pub use places::PlaceKind;
+pub use places::SlotID;
+pub use places::SlotTable;
+pub use places::StackFrame;
+pub use places::StackLocation;
+pub use places::align_up;
+pub use values::Locator;
+pub use values::RegisterSet;
+pub use values::ValueID;
+pub use values::ValueLocation;
 
 use std::{
     any::Any,
@@ -10,12 +25,18 @@ use std::{
     sync::Arc,
 };
 
+use crate::error::AnyResult;
+use crate::error::IRError;
+use crate::error::IRErrorKind;
+use crate::error::TypeError;
+use crate::error::TypeErrorKind;
+use crate::error::TypeResult;
+use crate::symbols::Symbol;
 use crate::{
     asm::Register,
-    error::{Counter, ResError, ResErrorKind, ResResult, Severity, print_err, unwrap_print},
+    error::{Counter, CrustError, Severity, print_err, unwrap_print},
     functions::FuncID,
     lexer::Position,
-    locations::{Locator, StackLocation, ValueLocation},
     parser::{Litteral, TypeSyntax},
     structs::{FieldID, StructFrame, StructID, StructTable},
     symbols::{SymbolBinding, SymbolID, SymbolTable},
@@ -31,7 +52,7 @@ pub struct SSA {
 }
 
 impl SSA {
-    pub fn new(stmts: Vec<TypedStatement>, tables: &mut Tables) -> ResResult<SSA> {
+    pub fn new(stmts: Vec<TypedStatement>, tables: &mut Tables) -> AnyResult<SSA> {
         let mut functions = Vec::new();
         for stmt in stmts {
             match stmt {
@@ -67,6 +88,7 @@ pub struct Function {
     pub identifier: String,
     pub blocks: Vec<BasicBlock>,
     pub slots: SlotTable,
+    pub ret_place: Option<Place>,
     pub args: Vec<SymbolID>,
     pub loops: Vec<LoopMerge>,
     pub locator: Locator,
@@ -79,7 +101,7 @@ impl Function {
         ret: TypeID,
         body: TypedBlock,
         tables: &mut Tables,
-    ) -> ResResult<Function> {
+    ) -> AnyResult<Function> {
         let mut blocks = Vec::new();
         let mut slot_table = SlotTable::new();
         let mut locator = Locator::new();
@@ -89,6 +111,28 @@ impl Function {
             String::from("entry"),
             0,
         )));
+        let ret_place = if !tables.type_handler.is_scalar(&ret)? {
+            let ret_ty = tables.type_handler.get(&ret, None)?;
+            let syntax = TypeSyntax::Reference {
+                mutable: true,
+                pointee: Box::new(TypeSyntax::Raw(ret_ty.identifier.clone())),
+            };
+            let ret_ref = tables.type_handler.lookup_or_define(syntax).unwrap();
+            let id = tables.symbol_table.insert(Symbol {
+                identifier: "@".to_owned(),
+                typeid: ret_ref.strong(),
+                mutable: false,
+            });
+            let value = locator.new_symbol(ret_ref, id, &mut slot_table);
+            params.push(id);
+            Some(Place {
+                kind: PlaceKind::Pointer(value),
+                offset: 0,
+                typeid: ret,
+            })
+        } else {
+            None
+        };
         for (sy, ty) in args {
             if tables
                 .symbol_table
@@ -106,6 +150,8 @@ impl Function {
             blocks,
             slots: slot_table,
             identifier,
+            ret_place,
+
             args: params,
             loops: Vec::new(),
             locator,
@@ -114,7 +160,7 @@ impl Function {
             if let Terminator::Unknown = func.get_terminator() {
             } else {
                 let _: () = print_err(
-                    ResError::new_warn(ResErrorKind::Unreachable, stmt.position()),
+                    IRError::new_err(IRErrorKind::Unreachable, stmt.position()),
                     &tables.file_contents,
                     &tables.type_handler,
                 );
@@ -123,14 +169,14 @@ impl Function {
         }
         if let Some(tail) = body.tail {
             let value = func.parse_value(*tail, tables)?;
-            func.set_terminator(Terminator::Return { value: Some(value) })?;
+            func.set_terminator(Terminator::ReturnValue { value: Some(value) })?;
         } else {
             if let Terminator::Unknown = func.get_terminator() {
                 if ret != TypeID::VOID {
-                    return Err(ResError::new_err(
-                        ResErrorKind::ExpectedReturnValue(ret),
+                    return Err(IRError::new_err(
+                        IRErrorKind::ExpectedReturnValue(ret),
                         body.position,
-                    ));
+                    ).to_any());
                 }
             }
         }
@@ -138,7 +184,7 @@ impl Function {
         Ok(func)
     }
 
-    pub fn parse_stmt(&mut self, stmt: TypedStatement, tables: &mut Tables) -> ResResult<()> {
+    pub fn parse_stmt(&mut self, stmt: TypedStatement, tables: &mut Tables) -> AnyResult<()> {
         match stmt {
             TypedStatement::VarDecl(ident, symbol_id, node) => {
                 node.infered_type().assert(node.position())?;
@@ -166,10 +212,17 @@ impl Function {
             }
             TypedStatement::Return(_, opt) => {
                 if let Some(child) = opt {
-                    let value = self.parse_value(child.clone(), tables)?;
-                    self.set_terminator(Terminator::Return { value: Some(value) })?;
+                    if let Some(ret_place) = self.ret_place.clone() {
+                        let src = self.parse_place(child, tables)?;
+                        let op = Operation::Copy(ret_place.clone(), src, ret_place.typeid);
+                        self.push(op);
+                        self.set_terminator(Terminator::ReturnValue { value: None })?;
+                    } else {
+                        let value = self.parse_value(child.clone(), tables)?;
+                        self.set_terminator(Terminator::ReturnValue { value: Some(value) })?;
+                    }
                 } else {
-                    self.set_terminator(Terminator::Return { value: None })?;
+                    self.set_terminator(Terminator::ReturnValue { value: None })?;
                 }
             }
             TypedStatement::Break(_, opt) => {
@@ -230,12 +283,12 @@ impl Function {
         Ok(())
     }
 
-    pub fn parse_block(&mut self, block: TypedBlock, tables: &mut Tables) -> ResResult<OpOutput> {
+    pub fn parse_block(&mut self, block: TypedBlock, tables: &mut Tables) -> AnyResult<OpOutput> {
         for stmt in block.stmts {
             if let Terminator::Unknown = self.get_terminator() {
             } else {
                 let _: () = print_err(
-                    ResError::new_warn(ResErrorKind::Unreachable, stmt.position()),
+                    IRError::new_err(IRErrorKind::Unreachable, stmt.position()),
                     &tables.file_contents,
                     &tables.type_handler,
                 );
@@ -249,8 +302,41 @@ impl Function {
         }
     }
 
-    pub fn parse_place(&mut self, node: TypedNode, tables: &mut Tables) -> ResResult<Place> {
+    pub fn parse_place(&mut self, node: TypedNode, tables: &mut Tables) -> AnyResult<Place> {
         match node.clone() {
+            TypedNode::FuncIdentifier(ty, id, args, pos) => {
+                let func = tables.func_table.get(&id).clone();
+                let mut ids = Vec::new();
+                if !func.big_ret {
+                    panic!("Expected big return type!");
+                }
+                let ret_ty = tables.type_handler.get(&func.ret, None)?;
+                let syntax = TypeSyntax::Reference {
+                    mutable: true,
+                    pointee: Box::new(TypeSyntax::Raw(ret_ty.identifier.clone())),
+                };
+                let ret_ref = 
+                tables.type_handler.lookup_or_define(syntax).unwrap();
+                let value = self.locator.new_value(
+                    ret_ref,
+                    &mut self.slots,
+                );
+                let place = Place {
+                    kind: PlaceKind::Slot(self.slots.new_temp(func.ret)),
+                    offset: 0,
+                    typeid: func.ret,
+                };
+                let op = Operation::AddressOf(value, place.clone());
+                self.push(op);
+                ids.push(value);
+                for arg in args {
+                    let value_id = self.parse_value(arg, tables)?;
+                    ids.push(value_id);
+                }
+                let op = Operation::Call(None, id, ids);
+                self.push(op);
+                Ok(place)
+            },
             TypedNode::StructConstructor(id, fields, pos) => {
                 if let TypeKind::Structure(struct_id) =
                     tables.type_handler.get(&id, Some(pos)).unwrap().kind
@@ -275,7 +361,7 @@ impl Function {
                     }
                     Ok(destination_place)
                 } else {
-                    Err(ResError::new_err(ResErrorKind::ExpectedStruct, pos))
+                    Err(TypeError::new_err(TypeErrorKind::ExpectedStruct, pos).to_any())
                 }
             }
             TypedNode::ArrayConstructor(ty, nodes, pos) => {
@@ -287,7 +373,7 @@ impl Function {
                         let place = Place {
                             kind: PlaceKind::Slot(slot),
                             offset: 0,
-                            typeid: ty
+                            typeid: ty,
                         };
                         let op = Operation::HugeConst(place, nodes[0].unwrap_const());
                         if array_type.size >= 8 {
@@ -330,11 +416,11 @@ impl Function {
                 if tables.type_handler.is_scalar(&ty.typeid)? {
                     let base = self.parse_place(*base, tables)?;
                     let index = self.parse_value(*index, tables)?;
-                    
+
                     let place = Place {
                         kind: PlaceKind::Index {
                             base: Box::new(base),
-                            index
+                            index,
                         },
                         offset: 0,
                         typeid: ty.typeid,
@@ -458,7 +544,7 @@ impl Function {
                     })
                 } else {
                     println!("{:?}", &ty.typeid);
-                    Err(ResError::new_err(ResErrorKind::ExpectedStruct, pos))
+                    Err(TypeError::new_err(TypeErrorKind::ExpectedStruct, pos).to_any())
                 }
             }
             TypedNode::Deref(ty, node, _) => {
@@ -474,21 +560,21 @@ impl Function {
                 todo!()
             }
             TypedNode::Parenthesis(_, node) => self.parse_place(*node, tables),
-            _ => Err(ResError::new_err(
-                ResErrorKind::ExpectedPlace(node.clone()),
+            _ => Err(IRError::new_err(
+                IRErrorKind::ExpectedPlace(node.clone()),
                 node.position(),
-            )),
+            ).to_any()),
         }
     }
-    pub fn parse_value(&mut self, node: TypedNode, tables: &mut Tables) -> ResResult<ValueID> {
+    pub fn parse_value(&mut self, node: TypedNode, tables: &mut Tables) -> AnyResult<ValueID> {
         match self.parse_node(node.clone(), tables)? {
             OpOutput::Scalar(value) => Ok(value),
             OpOutput::Memory(place) => {
                 if !tables.type_handler.is_scalar(&place.typeid)? {
-                    return Err(ResError::new_err(
-                        ResErrorKind::ExpectedScalar(node.clone()),
+                    return Err(IRError::new_err(
+                        IRErrorKind::ExpectedScalar(node.clone()),
                         node.position(),
-                    ));
+                    ).to_any());
                 }
 
                 let destination = self.locator.new_value(place.typeid, &mut self.slots);
@@ -501,12 +587,16 @@ impl Function {
             _ => todo!(),
         }
     }
-    pub fn resolve_place(&mut self, assignee: Assignee, tables: &mut Tables) -> ResResult<Place> {
+    pub fn resolve_place(&mut self, assignee: Assignee, tables: &mut Tables) -> AnyResult<Place> {
         println!("{:?}", assignee);
         match &assignee {
             Assignee::Symbol(sym) => {
                 let slot_id = self.slots.lookup(&sym).unwrap().clone();
-                println!("{:?} -> {:?}", tables.symbol_table.get(&sym).identifier, slot_id);
+                println!(
+                    "{:?} -> {:?}",
+                    tables.symbol_table.get(&sym).identifier,
+                    slot_id
+                );
                 let slot = self.slots.get(slot_id);
                 let place = Place {
                     kind: PlaceKind::Slot(slot_id),
@@ -517,21 +607,23 @@ impl Function {
             }
             Assignee::Index { base, index } => {
                 let base_place = self.resolve_place(*base.clone(), tables)?;
-                let index_value = self.parse_value(*index.clone(), tables)?; 
+                let index_value = self.parse_value(*index.clone(), tables)?;
                 let ty = tables.type_handler.get(&base_place.typeid, None)?;
                 if let TypeKind::Array(typeid, _) = ty.kind {
                     let place = Place {
-                        kind: PlaceKind::Index { base: Box::new(base_place), index: index_value },
+                        kind: PlaceKind::Index {
+                            base: Box::new(base_place),
+                            index: index_value,
+                        },
                         offset: 0,
-                        typeid: typeid 
+                        typeid: typeid,
                     };
                     Ok(place)
                 } else {
-                    Err(ResError {
-                        kind: ResErrorKind::ExpectedArray(base_place.typeid),
+                    Err(TypeError {
+                        kind: TypeErrorKind::ExpectedArray(base_place.typeid),
                         position: None,
-                        severity: Severity::Error,
-                    })
+                    }.to_any())
                 }
             }
             Assignee::Field { base, field } => {
@@ -543,20 +635,17 @@ impl Function {
                     let field_type = struc.get_type(field.clone());
                     Ok(base_place.offset(field_offset, field_type))
                 } else {
-                    Err(ResError {
-                        kind: ResErrorKind::ExpectedStruct,
+                    Err(TypeError {
+                        kind: TypeErrorKind::ExpectedStruct,
                         position: None,
-                        severity: Severity::Error,
-                    })
+                    }.to_any())
                 }
             }
             _ => todo!(),
         }
     }
 
-
-
-    pub fn parse_node(&mut self, node: TypedNode, tables: &mut Tables) -> ResResult<OpOutput> {
+    pub fn parse_node(&mut self, node: TypedNode, tables: &mut Tables) -> AnyResult<OpOutput> {
         match node.clone() {
             TypedNode::ArrayConstructor(_, _, _) => todo!(),
             TypedNode::StructConstructor(id, fields, pos) => {
@@ -584,7 +673,7 @@ impl Function {
                     }
                     Ok(OpOutput::Memory(destination_place))
                 } else {
-                    Err(ResError::new_err(ResErrorKind::ExpectedStruct, pos))
+                    Err(TypeError::new_err(TypeErrorKind::ExpectedStruct, pos).to_any())
                 }
             }
             TypedNode::Litteral(ty, litt, _) => match litt {
@@ -713,10 +802,10 @@ impl Function {
                             let then_type = self.locator.get(&then_value).typeid;
                             let else_type = self.locator.get(&else_value).typeid;
                             if then_type != else_type {
-                                return Err(ResError::new_err(
-                                    ResErrorKind::TypeMismatch(then_type, else_type),
+                                return Err(TypeError::new_err(
+                                    TypeErrorKind::TypeMismatch(then_type, else_type),
                                     pos,
-                                ));
+                                ).to_any());
                             }
                             let out_value = self.locator.new_value(then_type, &mut self.slots);
                             let op = Operation::Move(out_value, then_value);
@@ -733,13 +822,13 @@ impl Function {
                             if &then_place.typeid != &else_place.typeid
                                 || &then_place.offset != &else_place.offset
                             {
-                                return Err(ResError::new_err(
-                                    ResErrorKind::TypeMismatch(
+                                return Err(TypeError::new_err(
+                                    TypeErrorKind::TypeMismatch(
                                         then_place.typeid,
                                         else_place.typeid,
                                     ),
                                     pos,
-                                ));
+                                ).to_any());
                             }
 
                             let out_place = Place {
@@ -777,10 +866,10 @@ impl Function {
                     if let Some(tail) = body.tail.clone() {
                         if !tail.infered_type().strong || tail.infered_type().typeid == TypeID::VOID
                         {
-                            return Err(ResError::new_err(
-                                ResErrorKind::ExpectedElse(tail.infered_type().typeid),
+                            return Err(IRError::new_err(
+                                IRErrorKind::ExpectedElse(tail.infered_type().typeid),
                                 pos,
-                            ));
+                            ).to_any());
                         }
                     }
                     let then_res = self.parse_block(body, tables)?;
@@ -912,12 +1001,33 @@ impl Function {
             }
             TypedNode::Parenthesis(ty, child) => self.parse_node(*child, tables),
             TypedNode::FuncIdentifier(ty, id, args, pos) => {
+                let func = tables.func_table.get(&id).clone();
                 let mut ids = Vec::new();
+                if func.big_ret {
+                    let ret_ty = tables.type_handler.get(&func.ret, None)?;
+                    let syntax = TypeSyntax::Reference {
+                        mutable: true,
+                        pointee: Box::new(TypeSyntax::Raw(ret_ty.identifier.clone())),
+                    };
+                    let ret_ref = 
+                        tables.type_handler.lookup_or_define(syntax).unwrap();
+                    let value = self.locator.new_value(
+                        ret_ref,
+                        &mut self.slots,
+                    );
+                    let place = Place {
+                        kind: PlaceKind::Slot(self.slots.new_temp(func.ret)),
+                        offset: 0,
+                        typeid: func.ret,
+                    };
+                    let op = Operation::AddressOf(value, place);
+                    self.push(op);
+                    ids.push(value);
+                }
                 for arg in args {
                     let value_id = self.parse_value(arg, tables)?;
                     ids.push(value_id);
                 }
-                let func = tables.func_table.get(&id);
                 let return_type = tables.type_handler.get(&func.ret, Some(pos))?;
                 if return_type.size > 0 {
                     let value = self.locator.new_value(ty, &mut self.slots);
@@ -941,12 +1051,12 @@ impl Function {
         block: TypedBlock,
         tables: &mut Tables,
         value: ValueID,
-    ) -> ResResult<()> {
+    ) -> AnyResult<()> {
         for stmt in block.stmts {
             if let Terminator::Unknown = self.get_terminator() {
             } else {
                 let _: () = print_err(
-                    ResError::new_warn(ResErrorKind::Unreachable, stmt.position()),
+                    IRError::new_err(IRErrorKind::Unreachable, stmt.position()),
                     &tables.file_contents,
                     &tables.type_handler,
                 );
@@ -964,7 +1074,7 @@ impl Function {
         node: TypedNode,
         value: ValueID,
         tables: &mut Tables,
-    ) -> ResResult<()> {
+    ) -> AnyResult<()> {
         match node {
             TypedNode::FuncIdentifier(ty, id, args, pos) => {
                 let mut ids = Vec::new();
@@ -1050,7 +1160,7 @@ impl Function {
         block.operations.push(operation);
     }
 
-    pub fn set_terminator(&mut self, terminator: Terminator) -> ResResult<()> {
+    pub fn set_terminator(&mut self, terminator: Terminator) -> TypeResult<()> {
         let block: &mut BasicBlock = self.blocks.last_mut().unwrap();
         match block.terminator {
             Terminator::Unknown => block.terminator = terminator,
@@ -1095,7 +1205,7 @@ pub enum Terminator {
         destination: BlockLabel,
         inverse: BlockLabel,
     },
-    Return {
+    ReturnValue {
         value: Option<ValueID>,
     },
 }

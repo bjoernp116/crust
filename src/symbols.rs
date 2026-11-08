@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{error::ResResult, functions::FuncID, ssa::{SlotID, ValueID}, types::{InferedType, TypeHandler}};
+use crate::{error::TypeResult, functions::FuncID, ssa::{SlotID, ValueID}, types::{InferedType, TypeHandler}};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SymbolID(pub usize);
@@ -16,7 +16,7 @@ pub struct Symbol {
 }
 
 impl Symbol {
-    pub fn is_scalar(&self, th: &TypeHandler) -> ResResult<bool> {
+    pub fn is_scalar(&self, th: &TypeHandler) -> TypeResult<bool> {
         let res = !self.mutable && th.is_scalar(&self.typeid.typeid)?;
         Ok(res)
     }
@@ -43,7 +43,7 @@ impl SymbolTable {
         self.refs_table.insert(symbol);
     }
 
-    pub fn can_value_allocate(&self, id: &SymbolID, th: &TypeHandler) -> ResResult<bool> {
+    pub fn can_value_allocate(&self, id: &SymbolID, th: &TypeHandler) -> TypeResult<bool> {
         let symbol = self.get(id);
         Ok(symbol.is_scalar(th)? && self.refs_table.get(id).is_none())
     }

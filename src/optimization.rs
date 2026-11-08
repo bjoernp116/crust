@@ -1,9 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    asm::ARG_REGISTERS, error::Counter, functions::{self, FuncID}, locations::{Locator, RegisterSet}, parser::Litteral, ssa::{
-        BasicBlock, BlockLabel, Function, Operation, Place, PlaceKind, SlotID, SlotTable,
-        Terminator, ValueID,
+    asm::ARG_REGISTERS, error::Counter, functions::{self, FuncID}, parser::Litteral, ssa::{
+        BasicBlock, BlockLabel, Function, Operation, Place, PlaceKind, RegisterSet, SlotID, SlotTable, Terminator, ValueID
     }, types::{Tables, TypeID}
 };
 
@@ -124,7 +123,7 @@ impl FunctionAnalysis {
                 analysis.analyze_op(&operation, tables);
             }
             match &block.terminator {
-                Terminator::Return { value: Some(src) } => {
+                Terminator::ReturnValue { value: Some(src) } => {
                     analysis.read_value(&src);
                 }
                 Terminator::Branch {
@@ -178,7 +177,7 @@ impl FunctionAnalysis {
             }
             Operation::Call(dest_opt, func, values) => {
                 for (i, id) in values.iter().enumerate() {
-                    println!("{func:?}, {i}: {id}");
+                    //println!("{func:?}, {i}: {id}");
                     self.value_info.get_mut(&id).unwrap().output_arg.push((func.clone(), i));
                     self.value_info
                         .get_mut(&id)
@@ -469,7 +468,7 @@ impl FunctionAnalysis {
                 Operation::Call(_, _, values) => {
                     for value in values {
                         if let Some(litt) = self.rematerialized_consts.get(value) {
-                            println!("{}", value);
+                            //println!("{}", value);
                             new_operations.push(Operation::Const(value.clone(), litt.clone()));
                         }
                     }
@@ -594,13 +593,13 @@ impl FunctionAnalysis {
                     let info = self.value_info.get(&src).unwrap();
                     reads.increment(&src);
                     if reads.get(&src) >= info.reads {
-                        println!("{} dropped", src);
+                        //println!("{} dropped", src);
                         function.locator.drop(src);
                     }
                 }
             }
             match block.terminator {
-                Terminator::Return { value: Some(src) } => {
+                Terminator::ReturnValue { value: Some(src) } => {
                     let info = self.value_info.get(&src).unwrap();
                     reads.increment(&src);
                     if reads.get(&src) >= info.reads {

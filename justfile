@@ -1,3 +1,6 @@
+ssa:
+    cargo run -- ssa
+
 build:
     cargo run -- compile
 

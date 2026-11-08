@@ -1,3 +1,7 @@
+use std::{collections::HashMap, fmt::Display};
+
+use crate::{ssa::values::{ValueID}, symbols::SymbolID, types::{TypeHandler, TypeID}};
+
 
 #[derive(Debug, Clone)]
 pub struct Place {
@@ -78,6 +82,7 @@ impl SlotTable {
         self.slots.push(Slot {
             ty: type_id,
             dropped: false,
+            fixed_location: None,
         });
         self.bindings.insert(symbol_id, slot_id);
         slot_id
@@ -88,6 +93,7 @@ impl SlotTable {
         self.slots.push(Slot {
             ty: type_id,
             dropped: false,
+            fixed_location: None,
         });
         slot_id
     }
@@ -149,5 +155,47 @@ pub fn align_up(value: usize, alignment: usize) -> usize {
 pub struct Slot {
     pub ty: TypeID,
     pub dropped: bool,
+    pub fixed_location: Option<StackLocation>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StackLocation {
+    pub offset: usize,
+    pub size: usize,
+    pub pointer: bool,
+    pub type_id: TypeID,
+}
+
+impl StackLocation {
+    pub fn index(&self, rhs: &StackLocation) -> StackLocation {
+        StackLocation {
+            offset: self.offset + rhs.offset,
+            size: rhs.size,
+            pointer: self.pointer,
+            type_id: self.type_id,
+        }
+    }
+    pub fn new(type_id: TypeID, offset: usize, size: usize) -> StackLocation {
+        StackLocation {
+            offset,
+            size,
+            pointer: false,
+            type_id,
+        }
+    }
+}
+
+impl Display for StackLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let size = match self.size {
+            1 => "byte ptr",
+            2 => "word ptr",
+            4 => "dword ptr",
+            8 => "qword ptr",
+            _ => "",
+        };
+        write!(f, "{}[rbp - {:#x}]", size, self.offset)
+    }
+}
+
 

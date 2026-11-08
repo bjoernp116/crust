@@ -1,3 +1,7 @@
+use std::fmt::Display;
+
+use crate::{functions::FuncID, parser::Litteral, ssa::{places::Place, values::ValueID, values_to_string}, types::TypeID};
+
 
 #[derive(Debug, Clone)]
 pub enum Operation {
